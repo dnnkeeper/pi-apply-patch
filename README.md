@@ -1,21 +1,35 @@
-# pi-apply-patch (local fork)
+# pi-apply-patch
 
-A local fork of the Pi coding-agent `apply_patch` extension, tuned for fewer model mistakes and more actionable errors.
+`apply_patch` extension for the Pi coding agent. Applies Codex-format file patches (`Add` / `Update` / `Delete`) with atomic writes and helpful errors. Replaces the built-in `edit` / `write` tools.
 
-Source of the live copy: `C:/Users/dnnke/.pi/agent/extensions/pi-apply-patch-local/`.
-To install, copy `index.ts`, `line-endings.ts` and `write-file-atomic.ts` into your Pi `agent/extensions/` directory and reload Pi.
+## Features
 
-## Local changes vs upstream
+1. **Closest-match errors.** When an `Update` anchor does not match the file, the tool reports the closest matching window (1-based line number, matched/total lines, match percent), shows only the differing expected/actual line pairs, and gives explicit accept/decline guidance. Nothing is written on mismatch, and there are no giant dumps.
+2. **Richer tool description.** The tool spec documents all three hunk types and includes a two-file example, so models guess the patch format less often:
+   - `Add File`: no `@@` line, and EVERY content line must start with `+` (a blank file line is a lone `+`).
+   - `Update File`: each hunk starts with a bare `@@` line; unchanged lines get a single-space prefix, removals `-`, additions `+`. Context must match the file exactly.
+   - `Delete File`: header only, no body.
+3. **Add-File guideline.** A prompt guideline reminds models that `Add File` hunks carry no `@@` line and every content line, including blank ones, must start with `+`.
 
-1. **Closest-match error instead of opaque failure.** When an `Update File` hunk anchor does not match, the tool no longer dumps the whole expected block. It reports the closest window (1-based line, matched/total, percent), the first differing expected/actual line pairs only, and explicit accept/decline guidance. Nothing is written on mismatch.
-2. **Richer tool description.** The `apply_patch` description now documents all three hunk types (`Add File` without `@@` and with `+` on every line, `Update File` with a bare `@@`, `Delete File` header-only) plus a two-file example, so models guess the format less often.
-3. **Extra prompt guideline.** `Add File` hunks carry no `@@` line; every content line, including blank ones, must start with `+`.
+## Install
+
+1. Clone this repo into your Pi extensions folder so that the folder name matches the package name:
+   `git clone https://github.com/dnnkeeper/pi-apply-patch.git "<agent-dir>/extensions/pi-apply-patch"`
+   (`<agent-dir>` is usually `~/.pi/agent`.)
+2. Make sure the `diff` and `typebox` packages can be resolved from that folder (for example, run `npm install diff typebox` inside it).
+3. Register the package in `<agent-dir>/settings.json`:
+   `"packages": [ ..., "pi-apply-patch", ... ]`
+4. Reload Pi (`/reload`). The `edit` / `write` tools are then replaced by `apply_patch`.
+
+## Update
+
+Run `git pull` inside the extension folder, then `/reload` Pi.
 
 ## Files
 
-- `index.ts` - extension entry point, tool definition, patch parsing and application.
-- `line-endings.ts` - line-ending helpers (the live copy uses CRLF).
+- `index.ts` - tool definition, patch parsing and application.
+- `line-endings.ts` - line-ending helpers.
 - `write-file-atomic.ts` - atomic file writes.
-- `LICENSE` - upstream license.
+- `LICENSE` - license text.
 
-`node_modules/` and editor backups (`.bak`) are intentionally not committed.
+`node_modules/` and editor backups (`*.bak`) are intentionally not committed.
