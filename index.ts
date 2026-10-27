@@ -1218,22 +1218,27 @@ function replaceChunks(content: string, filePath: string, chunks: PatchChunk[]):
 async function applySingleHunk(
 	cwd: string,
 	hunk: ParsedPatch,
+	dryRun = false,
 ): Promise<{ summary: string; appliedFile: string; fuzz: number }> {
 	const absolutePath = await resolvePatchPath(cwd, hunk.filePath);
 	const absoluteMovePath =
 		hunk.type === "update" && hunk.movePath ? await resolvePatchPath(cwd, hunk.movePath) : undefined;
 	const mutationPaths = absoluteMovePath ? [absolutePath, absoluteMovePath] : [absolutePath];
 
-	return withPatchFileMutationQueues(mutationPaths, async () => {
+	const run = async () => {
 		if (hunk.type === "add") {
-			await mkdir(path.dirname(absolutePath), { recursive: true });
-			await writeFileAtomic(absolutePath, hunk.content);
+			if (!dryRun) {
+				await mkdir(path.dirname(absolutePath), { recursive: true });
+				await writeFileAtomic(absolutePath, hunk.content);
+			}
 			return { summary: `add: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: 0 };
 		}
 
 		if (hunk.type === "delete") {
 			await stat(absolutePath);
-			await rm(absolutePath);
+			if (!dryRun) {
+				await rm(absolutePath);
+			}
 			return { summary: `delete: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: 0 };
 		}
 
@@ -1245,10 +1250,12 @@ async function applySingleHunk(
 		const nextContent = chunkResult.content;
 
 		if (hunk.movePath && absoluteMovePath) {
-			await mkdir(path.dirname(absoluteMovePath), { recursive: true });
-			await writeFileAtomic(absoluteMovePath, nextContent);
-			if (absoluteMovePath !== absolutePath) {
-				await rm(absolutePath);
+			if (!dryRun) {
+				await mkdir(path.dirname(absoluteMovePath), { recursive: true });
+				await writeFileAtomic(absoluteMovePath, nextContent);
+				if (absoluteMovePath !== absolutePath) {
+					await rm(absolutePath);
+				}
 			}
 			return {
 				summary: `move: ${hunk.filePath} -> ${hunk.movePath}`,
@@ -1257,9 +1264,12 @@ async function applySingleHunk(
 			};
 		}
 
-		await writeFileAtomic(absolutePath, nextContent);
+		if (!dryRun) {
+			await writeFileAtomic(absolutePath, nextContent);
+		}
 		return { summary: `update: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: chunkResult.fuzz };
-	});
+	};
+	return withPatchFileMutationQueues(mutationPaths, run);
 }
 
 export async function applyPatchDetailed(
@@ -1279,6 +1289,33 @@ async function applyParsedPatchDetailed(
 	const appliedFiles: string[] = [];
 	const failures: ApplyPatchFailure[] = [];
 	let fuzz = 0;
+
+	// Validation pass: ensure every hunk applies before mutating anything (all-or-nothing).
+	const validationFailures: ApplyPatchFailure[] = [];
+	for (const hunk of hunks) {
+		try {
+			await applySingleHunk(cwd, hunk, true);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const code =
+				error && typeof error === "object" && "code" in error && typeof error.code === "string"
+					? error.code
+					: undefined;
+			validationFailures.push({ filePath: hunk.filePath, operation: hunk.type, message, code });
+		}
+	}
+	if (validationFailures.length > 0) {
+		const result: ApplyPatchResult = {
+			summaries,
+			appliedFiles,
+			failures: validationFailures,
+			hasPartialSuccess: false,
+			recoveryInstructions: { mustReadFiles: [], mustNotReadFiles: [], failedFiles: [] },
+			details: { fuzz: 0 },
+		};
+		result.recoveryInstructions = createRecoveryInstructions(result);
+		return result;
+	}
 
 	for (const hunk of hunks) {
 		try {
