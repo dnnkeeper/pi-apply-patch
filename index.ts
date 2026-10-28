@@ -1,4 +1,5 @@
 import { mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
@@ -45,7 +46,10 @@ type ApplyPatchToolDefinition = ToolDefinition<typeof APPLY_PATCH_PARAMS, ApplyP
 	freeform: FreeformToolFormat;
 };
 
-export type ApplyPatchExtensionAPI = Pick<ExtensionAPI, "on" | "getActiveTools" | "setActiveTools"> & {
+export type ApplyPatchExtensionAPI = Pick<
+	ExtensionAPI,
+	"on" | "getActiveTools" | "setActiveTools" | "registerCommand"
+> & {
 	registerTool: (tool: ApplyPatchToolDefinition) => void;
 };
 
@@ -1529,19 +1533,87 @@ async function createPendingPatchUpdate(
 	return { text: progress ? title : formatPendingPatchPaths(patchText), details: progress ? { progress } : undefined };
 }
 
-function withoutExtensionManagedEditTools(toolNames: string[]): string[] {
-	return toolNames.filter(
-		(toolName) =>
-			toolName !== "apply_patch" && !STANDARD_EDIT_TOOL_NAMES.some((editToolName) => editToolName === toolName),
-	);
+/** Tool set the extension manages: `apply_patch` plus Pi's built-in file editors. */
+const APPLY_PATCH_TOOL_NAME = "apply_patch";
+
+/**
+ * Which tools the extension declares to the model.
+ * - `additive`: `apply_patch` next to `edit`/`write` (default).
+ * - `replace`: `apply_patch` instead of `edit`/`write`.
+ * - `off`: only `edit`/`write`; `apply_patch` stays registered but is not declared to the model.
+ */
+export type ApplyPatchToolset = "additive" | "replace" | "off";
+
+export const APPLY_PATCH_TOOLSETS: readonly ApplyPatchToolset[] = ["additive", "replace", "off"];
+
+const DEFAULT_APPLY_PATCH_TOOLSET: ApplyPatchToolset = "additive";
+
+/** User-level config file: `~/.pi/agent/apply-patch.json`. */
+const TOOLSET_FILE_NAME = "apply-patch.json";
+
+export function isApplyPatchToolset(value: unknown): value is ApplyPatchToolset {
+	return value === "additive" || value === "replace" || value === "off";
 }
 
-function replaceEditToolsWithApplyPatch(toolNames: string[]): string[] {
-	return [...withoutExtensionManagedEditTools(toolNames), "apply_patch"];
+function resolveAgentDir(): string {
+	const configured = process.env.PI_CODING_AGENT_DIR;
+	if (!configured) {
+		return path.join(homedir(), ".pi", "agent");
+	}
+	if (configured === "~") {
+		return homedir();
+	}
+	if (configured.startsWith("~/") || configured.startsWith("~\\")) {
+		return path.join(homedir(), configured.slice(2));
+	}
+	return configured;
 }
 
-function replaceApplyPatchWithEditTools(toolNames: string[]): string[] {
-	return [...withoutExtensionManagedEditTools(toolNames), ...STANDARD_EDIT_TOOL_NAMES];
+export function applyPatchConfigPath(): string {
+	return path.join(resolveAgentDir(), TOOLSET_FILE_NAME);
+}
+
+/** Read the configured toolset. A missing or malformed file falls back to `additive`. */
+export async function readApplyPatchToolset(): Promise<ApplyPatchToolset> {
+	try {
+		const parsed: unknown = JSON.parse(await readFile(applyPatchConfigPath(), "utf-8"));
+		if (parsed !== null && typeof parsed === "object" && "toolset" in parsed && isApplyPatchToolset(parsed.toolset)) {
+			return parsed.toolset;
+		}
+	} catch {
+		// Missing file or invalid JSON: keep the default.
+	}
+	return DEFAULT_APPLY_PATCH_TOOLSET;
+}
+
+export async function writeApplyPatchToolset(toolset: ApplyPatchToolset): Promise<void> {
+	const filePath = applyPatchConfigPath();
+	await mkdir(path.dirname(filePath), { recursive: true });
+	await writeFileAtomic(filePath, `${JSON.stringify({ toolset }, null, 2)}\n`);
+}
+
+function isExtensionManagedTool(toolName: string): boolean {
+	return toolName === APPLY_PATCH_TOOL_NAME || STANDARD_EDIT_TOOL_NAMES.some((editToolName) => editToolName === toolName);
+}
+
+/** Rewrite a tool list for the given toolset, keeping the order of tools it does not manage. */
+export function applyApplyPatchToolset(toolNames: string[], toolset: ApplyPatchToolset): string[] {
+	const wanted = new Set<string>();
+	if (toolset !== "off") {
+		wanted.add(APPLY_PATCH_TOOL_NAME);
+	}
+	if (toolset !== "replace") {
+		for (const editToolName of STANDARD_EDIT_TOOL_NAMES) {
+			wanted.add(editToolName);
+		}
+	}
+	const next = toolNames.filter((toolName) => !isExtensionManagedTool(toolName) || wanted.has(toolName));
+	for (const toolName of wanted) {
+		if (!next.includes(toolName)) {
+			next.push(toolName);
+		}
+	}
+	return next;
 }
 
 function resolvePatchPath(cwd: string, filePath: string): string {
@@ -1574,16 +1646,28 @@ async function withPatchFileMutationQueues<T>(filePaths: string[], operation: ()
 	return runQueued(0);
 }
 
-function syncToolset(
+/**
+ * Enforce the configured toolset on the live session and return it.
+ * Runs on session start, model switch, before every agent run, and from the `/apply-patch` command.
+ */
+async function syncToolset(
 	pi: Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">,
-	model: Model<string> | undefined,
-): void {
-	// Local fork: apply_patch for every model, not just GPT.
-	// Upstream gates on isOpenAIGptModel(model); small local models never match,
-	// so the swap below runs unconditionally. (void model: parameter kept for API shape.)
-	void model;
-	const currentToolNames = pi.getActiveTools();
-	pi.setActiveTools(replaceEditToolsWithApplyPatch(currentToolNames));
+	toolset?: ApplyPatchToolset,
+): Promise<ApplyPatchToolset> {
+	const resolved = toolset ?? (await readApplyPatchToolset());
+	pi.setActiveTools(applyApplyPatchToolset(pi.getActiveTools(), resolved));
+	return resolved;
+}
+
+function describeToolset(toolset: ApplyPatchToolset): string {
+	switch (toolset) {
+		case "additive":
+			return "additive — apply_patch plus edit/write";
+		case "replace":
+			return "replace — apply_patch instead of edit/write";
+		case "off":
+			return "off — edit/write only, apply_patch hidden";
+	}
 }
 
 export function createApplyPatchTool(): ApplyPatchToolDefinition {
@@ -1758,16 +1842,71 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 export function registerApplyPatchExtension(pi: ApplyPatchExtensionAPI): void {
 	pi.registerTool(createApplyPatchTool());
 
-	pi.on("session_start", async (_event, ctx) => {
-		syncToolset(pi, ctx.model);
+	pi.on("session_start", async () => {
+		await syncToolset(pi);
 	});
 
-	pi.on("model_select", async (event) => {
-		syncToolset(pi, event.model);
+	pi.on("model_select", async () => {
+		await syncToolset(pi);
 	});
 
-	pi.on("before_agent_start", async (_event, ctx) => {
-		syncToolset(pi, ctx.model);
+	pi.on("before_agent_start", async () => {
+		await syncToolset(pi);
+	});
+
+	pi.registerCommand("apply-patch", {
+		description: "Choose the file-editing toolset: additive (apply_patch + edit/write), replace, off, or status",
+		getArgumentCompletions: (argumentPrefix) =>
+			APPLY_PATCH_TOOLSETS.filter((toolset) => toolset.startsWith(argumentPrefix.trim())).map((toolset) => ({
+				value: toolset,
+				label: toolset,
+				description: describeToolset(toolset),
+			})),
+		handler: async (args, ctx) => {
+			const requested = args.trim().toLowerCase();
+			const report = (toolset: ApplyPatchToolset) => {
+				ctx.ui.notify(
+					[
+						`toolset: ${describeToolset(toolset)}`,
+						`active tools: ${pi.getActiveTools().join(", ")}`,
+						`config: ${applyPatchConfigPath()}`,
+					].join("\n"),
+					"info",
+				);
+			};
+
+			if (requested === "" || requested === "status") {
+				const current = await readApplyPatchToolset();
+				if (requested === "status") {
+					report(current);
+					return;
+				}
+				const labels = APPLY_PATCH_TOOLSETS.map((toolset) => describeToolset(toolset));
+				const picked = await ctx.ui.select(`apply_patch toolset (current: ${current})`, [
+					...labels,
+					"status — show the current setting and active tools",
+				]);
+				const pickedToolset = APPLY_PATCH_TOOLSETS.find((toolset) => picked?.startsWith(toolset));
+				if (pickedToolset === undefined) {
+					report(current);
+					return;
+				}
+				await writeApplyPatchToolset(pickedToolset);
+				report(await syncToolset(pi, pickedToolset));
+				return;
+			}
+
+			if (!isApplyPatchToolset(requested)) {
+				ctx.ui.notify(
+					`Unknown toolset "${requested}". Use one of: ${APPLY_PATCH_TOOLSETS.join(", ")} (or run /apply-patch without arguments).`,
+					"warning",
+				);
+				return;
+			}
+
+			await writeApplyPatchToolset(requested);
+			report(await syncToolset(pi, requested));
+		},
 	});
 }
 
