@@ -106,6 +106,8 @@ export type ApplyPatchRecoveryInstructions = {
 	mustReadFiles: string[];
 	mustNotReadFiles: string[];
 	failedFiles: string[];
+	warnings: string[];
+	noOps: string[];
 };
 
 export type ApplyPatchResult = {
@@ -116,6 +118,8 @@ export type ApplyPatchResult = {
 	recoveryInstructions: ApplyPatchRecoveryInstructions;
 	details: {
 		fuzz: number;
+		warnings: string[];
+		noOps: string[];
 	};
 };
 
@@ -444,6 +448,23 @@ function seekSequence(
 	}
 
 	return undefined;
+}
+
+/** Number of exact full-file occurrences of the pattern; 0 when the pattern is empty. */
+function countExactMatches(lines: string[], pattern: string[]): number {
+	if (pattern.length === 0) return 0;
+	let count = 0;
+	for (let index = 0; index + pattern.length <= lines.length; index++) {
+		let matched = true;
+		for (let patternIndex = 0; patternIndex < pattern.length; patternIndex++) {
+			if (lines[index + patternIndex] !== pattern[patternIndex]) {
+				matched = false;
+				break;
+			}
+		}
+		if (matched) count++;
+	}
+	return count;
 }
 
 const FILE_HEADER_MARKERS = [
@@ -1166,14 +1187,25 @@ function parseNonEmptyPatch(patchText: string): ParsedPatch[] {
 	throw new PatchParseError("apply_patch verification failed: no hunks found");
 }
 
-function replaceChunks(content: string, filePath: string, chunks: PatchChunk[]): { content: string; fuzz: number } {
-	const source = SourceText.parse(content);
-	const originalLines = source.texts;
-	const replacements: LineReplacement[] = [];
-	let lineIndex = 0;
+function replaceChunks(
+	content: string,
+	filePath: string,
+	chunks: PatchChunk[],
+): { content: string; fuzz: number; matches: number; firstMatchLine?: number } {
+	// Chunks apply SEQUENTIALLY: each chunk is matched against the content produced by the
+	// previous chunk. This makes dependent hunks (-one/+ONE, then -ONE/+ONE-CHAIN) valid and
+	// matches how multi-hunk patches are authored. Endings: inserted lines adopt the file's
+	// preferred ending, untouched lines keep theirs (SourceText re-parsed at every step).
+	let current = content;
 	let fuzz = 0;
+	let matches = 0;
+	let firstMatchLine: number | undefined;
+	let patternOccurrences = 0;
 
 	for (const chunk of chunks) {
+		const source = SourceText.parse(current);
+		const originalLines = source.texts;
+		let lineIndex = 0;
 		for (const changeContext of chunk.changeContexts) {
 			const contextMatch = seekSequence(originalLines, [changeContext], lineIndex, false);
 			if (contextMatch === undefined) {
@@ -1186,40 +1218,55 @@ function replaceChunks(content: string, filePath: string, chunks: PatchChunk[]):
 		if (chunk.oldLines.length === 0) {
 			const insertionIndex =
 				originalLines[originalLines.length - 1] === "" ? originalLines.length - 1 : originalLines.length;
-			replacements.push({ start: insertionIndex, oldLength: 0, newLines: chunk.newLines });
+			current = source.replace([{ start: insertionIndex, oldLength: 0, newLines: chunk.newLines }]);
 			continue;
 		}
 
 		let pattern = chunk.oldLines;
 		let newLines = chunk.newLines;
-		let foundAt = seekSequence(originalLines, pattern, lineIndex, chunk.isEndOfFile);
+		// Search always starts at 0 on the CURRENT content: the patch orders chunks by intent,
+		// and every earlier chunk is already materialized. Occurrence counting (for the
+		// ambiguity warning) uses the ORIGINAL file content and the first real pattern.
+		let foundAt = seekSequence(originalLines, pattern, 0, chunk.isEndOfFile);
 		if (foundAt === undefined && pattern[pattern.length - 1] === "") {
 			pattern = pattern.slice(0, -1);
 			if (newLines[newLines.length - 1] === "") {
 				newLines = newLines.slice(0, -1);
 			}
-			foundAt = seekSequence(originalLines, pattern, lineIndex, chunk.isEndOfFile);
+			foundAt = seekSequence(originalLines, pattern, 0, chunk.isEndOfFile);
 		}
 
 		if (foundAt === undefined) {
-			throw new PatchApplicationError(`Failed to find expected lines in ${filePath} (${pattern.length} lines).\nExpected (first ${CLOSEST_MATCH_MAX_EXPECTED}):\n${formatExpectedLines(pattern)}\n${formatClosestMatch(filePath, pattern, lineIndex, originalLines)}`);
+			throw new PatchApplicationError(`Failed to find expected lines in ${filePath} (${pattern.length} lines).\nExpected (first ${CLOSEST_MATCH_MAX_EXPECTED}):\n${formatExpectedLines(pattern)}\n${formatClosestMatch(filePath, pattern, 0, originalLines)}\nHint: chunks apply top-to-bottom; each chunk sees the file after the previous chunks of this patch. If this chunk was written against the untouched file, split it into a separate apply_patch call.`);
 		}
 
 		fuzz += foundAt.fuzz;
-		replacements.push(
-			...replacementsAroundContext(foundAt.index, pattern.length, newLines, chunk.contextLineIndices),
-		);
-		lineIndex = foundAt.index + pattern.length;
+		if (matches === 0) {
+			firstMatchLine = foundAt.index + 1;
+			patternOccurrences = countExactMatches(originalLines, pattern);
+		}
+		matches++;
+		// Sequential rewrite of the matched region. Context lines inside the chunk are already
+		// part of `pattern`; a plain span replacement keeps their exact text and endings, and
+		// inserted lines take the file's preferred ending via source.replace.
+		current = source.replace([
+			{ start: foundAt.index, oldLength: pattern.length, newLines },
+		]);
 	}
 
-	return { content: source.replace(replacements), fuzz };
+	return {
+		content: current,
+		fuzz,
+		matches: Math.max(1, patternOccurrences),
+		firstMatchLine,
+	};
 }
 
 async function applySingleHunk(
 	cwd: string,
 	hunk: ParsedPatch,
 	dryRun = false,
-): Promise<{ summary: string; appliedFile: string; fuzz: number }> {
+): Promise<{ summary: string; appliedFile: string; fuzz: number; matches: number; firstMatchLine?: number; noOp: boolean }> {
 	const absolutePath = await resolvePatchPath(cwd, hunk.filePath);
 	const absoluteMovePath =
 		hunk.type === "update" && hunk.movePath ? await resolvePatchPath(cwd, hunk.movePath) : undefined;
@@ -1227,11 +1274,25 @@ async function applySingleHunk(
 
 	const run = async () => {
 		if (hunk.type === "add") {
+			// Guard against silent overwrite: Add File onto an existing path destroys its content.
+			// Must run in dry-run too, so the validation pass rejects the whole patch.
+			let addTargetExists = false;
+			try {
+				await stat(absolutePath);
+				addTargetExists = true;
+			} catch (error) {
+				if (!hasErrorCode(error, "ENOENT")) throw error;
+			}
+			if (addTargetExists) {
+				throw new PatchApplicationError(
+					`Add File target already exists: ${hunk.filePath}. Use Update File to change it, or Delete File first if recreation is intended.`,
+		);
+			}
 			if (!dryRun) {
 				await mkdir(path.dirname(absolutePath), { recursive: true });
 				await writeFileAtomic(absolutePath, hunk.content);
 			}
-			return { summary: `add: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: 0 };
+			return { summary: `add: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: 0, matches: 1, noOp: false };
 		}
 
 		if (hunk.type === "delete") {
@@ -1239,13 +1300,13 @@ async function applySingleHunk(
 			if (!dryRun) {
 				await rm(absolutePath);
 			}
-			return { summary: `delete: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: 0 };
+			return { summary: `delete: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: 0, matches: 1, noOp: false };
 		}
 
 		const currentContent = await readFile(absolutePath, "utf-8");
 		const chunkResult =
 			hunk.chunks.length === 0
-				? { content: currentContent, fuzz: 0 }
+				? { content: currentContent, fuzz: 0, matches: 1, firstMatchLine: undefined }
 				: replaceChunks(currentContent, hunk.filePath, hunk.chunks);
 		const nextContent = chunkResult.content;
 
@@ -1261,13 +1322,23 @@ async function applySingleHunk(
 				summary: `move: ${hunk.filePath} -> ${hunk.movePath}`,
 				appliedFile: hunk.movePath,
 				fuzz: chunkResult.fuzz,
+				matches: Math.max(1, chunkResult.matches),
+				firstMatchLine: chunkResult.firstMatchLine,
+				noOp: nextContent === currentContent,
 			};
 		}
 
 		if (!dryRun) {
 			await writeFileAtomic(absolutePath, nextContent);
 		}
-		return { summary: `update: ${hunk.filePath}`, appliedFile: hunk.filePath, fuzz: chunkResult.fuzz };
+		return {
+			summary: `update: ${hunk.filePath}`,
+			appliedFile: hunk.filePath,
+			fuzz: chunkResult.fuzz,
+			matches: Math.max(1, chunkResult.matches),
+			firstMatchLine: chunkResult.firstMatchLine,
+			noOp: nextContent === currentContent,
+		};
 	};
 	return withPatchFileMutationQueues(mutationPaths, run);
 }
@@ -1289,6 +1360,8 @@ async function applyParsedPatchDetailed(
 	const appliedFiles: string[] = [];
 	const failures: ApplyPatchFailure[] = [];
 	let fuzz = 0;
+	const noOps: string[] = [];
+	const warnings: string[] = [];
 
 	// Validation pass: ensure every hunk applies before mutating anything (all-or-nothing).
 	const validationFailures: ApplyPatchFailure[] = [];
@@ -1310,8 +1383,8 @@ async function applyParsedPatchDetailed(
 			appliedFiles,
 			failures: validationFailures,
 			hasPartialSuccess: false,
-			recoveryInstructions: { mustReadFiles: [], mustNotReadFiles: [], failedFiles: [] },
-			details: { fuzz: 0 },
+			recoveryInstructions: { mustReadFiles: [], mustNotReadFiles: [], failedFiles: [], warnings: [], noOps: [] },
+			details: { fuzz: 0, warnings: [], noOps: [] },
 		};
 		result.recoveryInstructions = createRecoveryInstructions(result);
 		return result;
@@ -1319,10 +1392,16 @@ async function applyParsedPatchDetailed(
 
 	for (const hunk of hunks) {
 		try {
-			const { summary, appliedFile, fuzz: hunkFuzz } = await applySingleHunk(cwd, hunk);
+			const { summary, appliedFile, fuzz: hunkFuzz, matches, firstMatchLine, noOp } = await applySingleHunk(cwd, hunk);
 			summaries.push(summary);
 			appliedFiles.push(appliedFile);
 			fuzz += hunkFuzz;
+			if (noOp) {
+				noOps.push(appliedFile);
+			}
+			if (matches > 1) {
+				warnings.push(`${hunk.filePath}: pattern matched ${matches} places, applied at the first (line ${firstMatchLine ?? "?"}). Include more surrounding lines to disambiguate.`);
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			const code =
@@ -1343,8 +1422,8 @@ async function applyParsedPatchDetailed(
 		appliedFiles,
 		failures,
 		hasPartialSuccess: appliedFiles.length > 0 && failures.length > 0,
-		recoveryInstructions: { mustReadFiles: [], mustNotReadFiles: [], failedFiles: [] },
-		details: { fuzz },
+		recoveryInstructions: { mustReadFiles: [], mustNotReadFiles: [], failedFiles: [], warnings: [], noOps: [] },
+		details: { fuzz, warnings, noOps },
 	};
 	result.recoveryInstructions = createRecoveryInstructions(result);
 	return result;
@@ -1358,13 +1437,19 @@ function isRereadCandidate(failure: ApplyPatchFailure): boolean {
 }
 
 function createRecoveryInstructions(
-	result: Pick<ApplyPatchResult, "appliedFiles" | "failures">,
+	result: Pick<ApplyPatchResult, "appliedFiles" | "failures" | "details">,
 ): ApplyPatchRecoveryInstructions {
 	const mustReadFiles = [...new Set(result.failures.filter(isRereadCandidate).map((failure) => failure.filePath))];
 	const mustReadFileSet = new Set(mustReadFiles);
 	const failedFileSet = new Set(result.failures.map((failure) => failure.filePath));
 	const mustNotReadFiles = [...new Set(result.appliedFiles.filter((filePath) => !mustReadFileSet.has(filePath)))];
-	return { mustReadFiles, mustNotReadFiles, failedFiles: [...failedFileSet] };
+	return {
+		mustReadFiles,
+		mustNotReadFiles,
+		failedFiles: [...failedFileSet],
+		warnings: result.details.warnings,
+		noOps: result.details.noOps,
+	};
 }
 
 export async function applyPatch(cwd: string, patchText: string): Promise<string[]> {
@@ -1392,8 +1477,9 @@ export async function applyPatch(cwd: string, patchText: string): Promise<string
 				recoveryInstructions: createRecoveryInstructions({
 					appliedFiles,
 					failures: [failure],
+					details: { fuzz: 0, warnings: [], noOps: [] },
 				}),
-				details: { fuzz: 0 },
+				details: { fuzz: 0, warnings: [], noOps: [] },
 			};
 			throw new ApplyPatchError(message, result);
 		}
@@ -1515,6 +1601,7 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 		promptGuidelines: [
 			"Use apply_patch for file edits instead of mutating files through bash, Python scripts, heredocs, or shell redirection.",
 			"In *** Add File *** hunks there is no @@ line: every content line, including blank ones, must start with +.",
+		"An ambiguous anchor matches the FIRST occurrence; to edit a later duplicate block, extend the hunk with unique surrounding lines until the pattern matches only one place.",
 			"After apply_patch succeeds, do not re-read the edited files just to confirm the patch applied.",
 		],
 		async execute(
@@ -1593,12 +1680,21 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 								.join("\n"),
 						},
 					],
+					isError: true,
 					details: preview ? { preview, result } : { result },
 				};
 			}
 
+			const postLines = [
+				...result.recoveryInstructions.warnings,
+				...(result.recoveryInstructions.noOps.length > 0
+					? [`No-op for: ${result.recoveryInstructions.noOps.join(", ")} (content was already identical).`]
+					: []),
+			];
 			return {
-				content: [{ type: "text", text: result.summaries.join("\n") }],
+				content: [
+					{ type: "text", text: postLines.length > 0 ? [...result.summaries, ...postLines].join("\n") : result.summaries.join("\n") },
+				],
 				details: preview ? { preview, result } : { result },
 			};
 		},

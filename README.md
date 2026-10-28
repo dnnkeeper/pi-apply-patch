@@ -4,12 +4,17 @@
 
 ## Features
 
-1. **Closest-match errors.** When an `Update` anchor does not match the file, the tool reports the closest matching window (1-based line number, matched/total lines, match percent), shows only the differing expected/actual line pairs, and gives explicit accept/decline guidance. Nothing is written on mismatch, and there are no giant dumps.
-2. **Richer tool description.** The tool spec documents all three hunk types and includes a two-file example, so models guess the patch format less often:
+1. **Failures are real errors.** A rejected or partially applied patch returns the tool result with `isError: true`, so programmatic callers (codemode scripts) see a rejected promise instead of a success string containing "apply_patch failed".
+2. **Closest-match errors.** When an `Update` anchor does not match the file, the tool reports the closest matching window (1-based line number, matched/total lines, match percent), shows only the differing expected/actual line pairs, and gives explicit accept/decline guidance. Nothing is written on mismatch, and there are no giant dumps.
+3. **No silent overwrite by Add File.** `Add File` onto an existing path is rejected (with the whole patch) instead of destroying the file. Use `Update File`, or `Delete File` first.
+4. **Sequential chunks.** Chunks of one `Update File` hunk apply top-to-bottom: each chunk sees the file after the previous chunks, so dependent hunks (`-one`/`+ONE`, then `-ONE`/`+ONE-CHAIN`) work.
+5. **Ambiguity warnings.** When a pattern matches several places in the file, the result says so with the occurrence count and the line the edit landed on, instead of silently applying to the first occurrence.
+6. **No-op detection.** A hunk that leaves the content byte-identical is reported as a no-op instead of a silent "success".
+7. **Richer tool description.** The tool spec documents all three hunk types and includes a two-file example, so models guess the patch format less often:
    - `Add File`: no `@@` line, and EVERY content line must start with `+` (a blank file line is a lone `+`).
    - `Update File`: each hunk starts with a bare `@@` line; unchanged lines get a single-space prefix, removals `-`, additions `+`. Context must match the file exactly.
    - `Delete File`: header only, no body.
-3. **Add-File guideline.** A prompt guideline reminds models that `Add File` hunks carry no `@@` line and every content line, including blank ones, must start with `+`.
+8. **Prompt guidelines.** Reminders for `Add File` syntax and for disambiguating duplicate blocks (ambiguous anchors match the first occurrence).
 
 ## Install
 

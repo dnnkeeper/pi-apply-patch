@@ -4,9 +4,13 @@
   "description": "Pi extension: atomic apply_patch tool with closest-match error recovery",
   "type": "module",
   "private": true,
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
@@ -17,5 +21,9 @@
   },
   "dependencies": {
     "diff": "^8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }

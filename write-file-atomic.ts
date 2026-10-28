@@ -26,8 +26,23 @@ export async function writeFileAtomic(
 	try {
 		await operations.rename(tempPath, absPath);
 	} catch (error) {
-		if (!hasErrorCode(error, "EEXIST")) {
+		// Windows: rename over an existing file commonly surfaces as EPERM (antivirus or
+		// indexer holding the destination open) instead of the POSIX-style EEXIST.
+		if (!hasErrorCode(error, "EEXIST") && !hasErrorCode(error, "EPERM")) {
 			throw error;
+		}
+		// Transient external locks can clear within milliseconds; one short retry before
+		// unlinking the destination, which would otherwise destroy it while locked.
+		if (hasErrorCode(error, "EPERM")) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			try {
+				await operations.rename(tempPath, absPath);
+				return;
+			} catch (retryError) {
+				if (!hasErrorCode(retryError, "EEXIST") && !hasErrorCode(retryError, "EPERM")) {
+					throw retryError;
+				}
+			}
 		}
 		await operations.unlink(absPath);
 		await operations.rename(tempPath, absPath);
