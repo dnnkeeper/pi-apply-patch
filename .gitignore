@@ -2,3 +2,5 @@ node_modules/
 *.bak
 .DS_Store
 Thumbs.db
+lab/out/
+lab/.lab*/
