@@ -9,6 +9,12 @@ By default the tool is **additive** — the model sees `apply_patch` next to Pi'
 - Pi `@earendil-works/pi-coding-agent` 1.3.0 or newer (verified on 1.4.0).
 - `diff` and `typebox` resolvable from the extension folder.
 
+When the extension is loaded straight out of a git checkout, `diff` comes from an `npm install` there
+— a git-installed package is not dependency-installed automatically. Without it the extension fails to
+load (`Cannot find module 'diff'`) and `apply_patch` silently disappears from the toolset while every
+other tool keeps working, so the failure is easy to miss. `node_modules/` in that checkout is a working
+dependency, not build output.
+
 ## The tool
 
 `apply_patch` takes one freeform string (not JSON), wrapped in an envelope:
@@ -29,10 +35,55 @@ Three hunk types:
 | Hunk | What it does |
 | --- | --- |
 | `*** Add File: <path>` | Creates a file. No `@@` line; every content line starts with `+` (a blank file line is a lone `+`). Refuses to overwrite an existing path. |
-| `*** Update File: <path>` | Edits in place, optionally followed by `*** Move to: <path>`. Each chunk starts with a bare `@@`; unchanged lines are prefixed with one space, removals with `-`, additions with `+`. Context must match the file exactly. |
+| `*** Update File: <path>` | Edits in place, optionally followed by `*** Move to: <path>`. Each chunk starts with a bare `@@`; unchanged lines are prefixed with one space, removals with `-`, additions with `+`. Context must match the file exactly. `@@ <text>` is not a comment: `<text>` must be a line that exists in the file (it is searched as an anchor and the block is rejected when it is absent), but it does not steer placement — the `-`/` ` lines below it do. |
 | `*** Delete File: <path>` | Deletes a file. Header only, no body. |
 
 One patch may hold hunks for several files. Chunks inside a single `Update File` apply top to bottom, so a later chunk sees the result of the previous one.
+
+### Arguments
+
+| Argument | Required | What it is |
+| --- | --- | --- |
+| `input` | yes | The patch text above — the whole `*** Begin Patch` … `*** End Patch` envelope. |
+| `verify` | no | Post-write assertions checked in the same call (see below). |
+
+### `verify` — assert the invariant the diff cannot prove
+
+A patch proves that it *matched*; it cannot prove a property now holds for the whole project — that a
+removed name occurs nowhere else, or that a heading survived a renumbering. `verify` closes that gap in
+the same round-trip (`verify.ts`):
+
+```json
+"verify": [
+  { "path": "**/*.md", "mustNotContain": ["Work mode", "FAST"] },
+  { "path": "project/AGENTS.md", "mustContain": ["Evidence"] }
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `path` | Scope: a file, a directory (recursive), or a glob (`**` spans directories, `*`/`?` stay inside one segment). Omitting it checks only the files this patch wrote. |
+| `mustContain` | Each substring must appear at least once in the scope. A bare string is accepted for one needle. |
+| `mustNotContain` | Each substring must appear nowhere in the scope. A bare string is accepted for one needle. |
+Limits (silently applied, never a failure): 20 checks, 20 needles per check, 200 chars per needle, 2000
+files scanned, 2 MB per file, binary files skipped. Needles are case-sensitive literal substrings per
+line — no regex, no shell, nothing to escape.
+
+The verdict is one machine-stable line:
+
+```
+VERIFY_OK checks=2 files=3
+VERIFY_FAIL 1 of 2 check(s) — patch applied, invariant does not hold
+- mustNotContain "Work mode" still present: project/AGENTS.md:28, project/.ai_memory/active_task.md:8
+Fix the file(s) above with another apply_patch call (no re-read needed: the hits give file:line), or drop the check if the invariant was wrong.
+```
+
+A failing check sets `isError: true` but does **not** roll the write back: the change is on disk and the
+message names `file:line` for the next call. Without `verify`, behaviour is byte-identical to before.
+
+`verify` sent with a `path` but no needles is **not** treated as a pass: the result carries
+`VERIFY_SKIPPED — … this is not a pass`, with the exact shape to resend. Small models do drop nested
+arrays, so this is the common real-world failure, and silence would be a lie.
 
 ### What happens on failure
 
@@ -45,7 +96,30 @@ One patch may hold hunks for several files. Chunks inside a single `Update File`
 
 ### Prompt integration
 
-The tool ships a rich description (all three hunk types plus a two-file example), so models guess the patch format less often, and prompt guidelines that remind the model to use `apply_patch` instead of mutating files through `bash` or scripts, and how to disambiguate duplicate blocks. On providers that support OpenAI grammar tools the patch is constrained by the Codex Lark grammar; everyone else gets the plain function tool.
+The description is written for a model that has never seen the tool: it states the envelope first, then
+the line rules where patches actually fail (one `' '`/`-`/`+` per line, no unified-diff ranges, verbatim
+context, top-to-bottom chunk order), then `verify`, then a full multi-hunk example, and ends with the two
+anti-patterns — re-reading files to confirm a patch, and retrying a failed patch unchanged. Prompt
+guidelines add the short forms (Add File has no `@@`; an ambiguous anchor matches the first occurrence;
+use `verify` instead of a follow-up grep). On providers that support OpenAI grammar tools the patch is
+constrained by the Codex Lark grammar; everyone else gets the plain function tool.
+
+## Tests
+
+```sh
+node lab/verify.test.mjs        # verify.ts: scopes, globs, needles, verdict formatting — 24 checks, no SDK
+node lab/description.test.mjs   # the description's worked example must apply; every rule it states must hold — 19 checks
+node lab/claims.test.mjs        # behavioural claims in the docs: rewrite routes, @@ anchors, verify gating — 9 checks
+node lab/e2e-jiti.test.mjs      # index.ts through jiti: real patch + verify round-trip — 14 checks
+```
+
+The first two suites are the guard against a lying prompt: `description.test.mjs` extracts the example
+out of the tool description, applies it to a matching fixture, and asserts each prose rule the
+description states; `claims.test.mjs` does the same for behavioural claims in this README (the two
+whole-file rewrite routes, what `@@ <text>` really does, `verify` being skipped on a failed patch). The
+SDK-dependent suites load `index.ts` through `jiti` exactly as Pi does, so they need `diff`, `typebox` and
+the Pi packages resolvable from the extension folder. The older `lab/run*.mjs` scripts run against a
+prebuilt `lab/out/`.
 
 ## Toolset
 

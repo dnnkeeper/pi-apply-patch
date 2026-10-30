@@ -15,12 +15,47 @@ import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import * as Diff from "diff";
 import { Type } from "typebox";
 import { type ContextLineIndex, type LineReplacement, replacementsAroundContext, SourceText } from "./line-endings.js";
+import {
+	type ApplyPatchVerification,
+	type ApplyPatchVerifyCheck,
+	finalizeSuccessfulPatch,
+	IGNORED_VERIFY_LINE,
+	normalizeVerifyChecks,
+} from "./verify.js";
 import { writeFileAtomic } from "./write-file-atomic.js";
 
 const APPLY_PATCH_PARAMS = Type.Object({
 	input: Type.String({
 		description: "The entire contents of the apply_patch command",
 	}),
+	verify: Type.Optional(
+		Type.Array(
+			Type.Object({
+				path: Type.Optional(
+					Type.String({
+						description:
+							"Scope to assert over: a file, a directory, or a glob such as '**/*.md'. Omit to check only the files this patch wrote.",
+					}),
+				),
+				mustContain: Type.Optional(
+					Type.Union([Type.String(), Type.Array(Type.String())], {
+						description:
+							"Substring(s) that must each appear at least once in the scope. A plain string is accepted for a single needle.",
+					}),
+				),
+				mustNotContain: Type.Optional(
+					Type.Union([Type.String(), Type.Array(Type.String())], {
+						description:
+							"Substring(s) that must appear nowhere in the scope (e.g. a name this patch removes). A plain string is accepted for a single needle.",
+					}),
+				),
+			}),
+			{
+				description:
+					"Post-write assertions, checked in this same call. Use it for invariants a diff cannot prove: a removed name is gone project-wide, or a heading survived a change. Cheaper and stricter than a follow-up grep.",
+			},
+		),
+	),
 });
 
 type ParsedPatch =
@@ -55,6 +90,15 @@ export type ApplyPatchExtensionAPI = Pick<
 
 type ApplyPatchParams = {
 	input: string;
+	verify?: ApplyPatchVerifyCheck[] | undefined;
+	/** True when the model sent a `verify` argument that normalized to zero usable checks. */
+	verifyDropped?: boolean | undefined;
+	/**
+	 * The `verify` value exactly as the caller sent it. Kept so normalization is idempotent:
+	 * `prepareArguments` runs first and its output is normalized AGAIN in `execute`, which would
+	 * otherwise see no `verify` at all and silently report a clean patch.
+	 */
+	verifyRaw?: unknown;
 };
 
 type ApplyPatchOperation = "add" | "delete" | "update";
@@ -78,6 +122,7 @@ type ApplyPatchToolDetails = {
 	preview?: ApplyPatchPreview;
 	progress?: ApplyPatchProgress;
 	result?: ApplyPatchResult;
+	verification?: ApplyPatchVerification;
 };
 
 type ApplyPatchProgress = {
@@ -314,10 +359,18 @@ function normalizeApplyPatchArguments(args: unknown): ApplyPatchParams {
 		return { input: args };
 	}
 
-	if (args && typeof args === "object" && "input" in args) {
-		const input = (args as { input?: unknown }).input;
-		if (typeof input === "string") {
-			return { input };
+	if (args && typeof args === "object") {
+		const record = args as { input?: unknown; verify?: unknown; verifyRaw?: unknown };
+		const rawVerify = record.verify !== undefined ? record.verify : record.verifyRaw;
+		const verify = normalizeVerifyChecks(rawVerify);
+		const verifyDropped = rawVerify !== undefined && rawVerify !== null && verify === undefined;
+		if (typeof record.input === "string") {
+			return {
+				input: record.input,
+				...(verify ? { verify } : {}),
+				...(verifyDropped ? { verifyDropped } : {}),
+				...(rawVerify !== undefined ? { verifyRaw: rawVerify } : {}),
+			};
 		}
 	}
 
@@ -326,14 +379,47 @@ function normalizeApplyPatchArguments(args: unknown): ApplyPatchParams {
 
 const STANDARD_EDIT_TOOL_NAMES = ["edit", "write"] as const;
 export const APPLY_PATCH_FREEFORM_DESCRIPTION =
-	"Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON. " +
-	"Always wrap the patch in a *** Begin Patch / *** End Patch envelope. One patch can hold hunks for several files. " +
-	"Valid hunk headers: *** Add File: {path}, *** Update File: {path}, *** Delete File: {path}. " +
-	"Add File: no @@ line, and EVERY content line must start with + (a blank file line is a lone +). " +
-	"Update File: start each hunk with a bare @@ line, never unified-diff headers like @@ -1 +1,2 @@. Prefix unchanged lines with a single space, removed lines with -, added lines with +. " +
-	"Copy context lines exactly from a fresh file read, including indentation: on mismatch nothing is written and the error shows the closest match with accept/decline guidance. " +
-	"Delete File: header only, no body. Example:\n" +
-	"*** Begin Patch\n*** Add File: hello.txt\n+Hello world.\n*** Update File: example.txt\n@@\n Hello from the original text file.\n+Second line added.\n*** End Patch";
+	"START AND END EVERY PATCH WITH THE ENVELOPE — a patch without '*** Begin Patch' as its first line is rejected:\n" +
+	"*** Begin Patch\\n<one or more hunks>\\n*** End Patch\n" +
+	"Edit files by sending ONE such patch as raw text — this is a FREEFORM tool, so the patch is NOT JSON and must not be quoted or escaped. " +
+	"The patch text is the `input` argument. Next to it there is an optional `verify` argument: input = what to change, verify = what must be true afterwards. " +
+	"If your tool schema shows a `verify` argument, use it (see USE verify below) instead of reading the files again afterwards.\n" +
+	"\n" +
+	"Hunk headers: '*** Add File: <path>', '*** Update File: <path>' (optionally followed by '*** Move to: <path>'), '*** Delete File: <path>'. " +
+	"Any number of hunks, any mix of files, one call.\n" +
+	"\n" +
+	"USE verify — this is the difference between 'I edited some lines' and 'the change is true'. Pass it whenever the request is project-wide or negative: " +
+	"'everywhere', 'all files', 'nothing left', 'remove', 'rename', 'deprecate', or whenever you would otherwise grep/read the result to be sure. " +
+	"It runs in this same call and answers with one line — 'VERIFY_OK checks=N files=M' or 'VERIFY_FAIL ...' with file:line — so the follow-up grep or read is redundant. " +
+	"Shape: [{\"path\": \"**/*.md\", \"mustNotContain\": [\"OldName\"]}, {\"path\": \"docs/x.md\", \"mustContain\": [\"NewName\"]}]. " +
+	"needles are case-sensitive literal substrings (no regex); path is a file, a directory or a glob (** spans directories, * stays inside one segment), and omitting path checks only the files this patch wrote. " +
+	"A failing check does NOT roll the write back: it names what still violates the invariant so the next call can fix it.\n" +
+	"\n" +
+	"LINE RULES (this is where patches usually fail):\n" +
+	"- every line inside a hunk starts with exactly one of ' ' (unchanged), '-' (removed) or '+' (added); nothing else may start a line.\n" +
+	"- Add File: no '@@' line at all; every content line starts with '+', and a blank line is a lone '+'.\n" +
+	"- Update File: each change block starts with a bare '@@' line, or '@@ <text>' where <text> must be a line that EXISTS in the file: it is searched as an anchor and the block is rejected if it is not found, but it does not control where the edit lands (the '-'/' ' lines below it do). Never use it as a comment or a label. Never write unified-diff ranges such as '@@ -1 +1,2 @@'. " +
+	"'*** End of File' as the last line of a block means 'anchor at the end of the file'.\n" +
+	"- context lines must be copied VERBATIM from the file, indentation and trailing spaces included: the patch matches text, it does not paraphrase. Include 3 lines of surrounding context so the anchor is unique.\n" +
+	"- hunks apply top-to-bottom, each against the result of the previous one; a later hunk sees earlier edits.\n" +
+	"- a whole-file rewrite is either Delete File now + Add File in a later call, or one Update File whose '-' lines are the entire old content.\n" +
+	"\n" +
+	"AFTER SUCCESS: do not re-read the files you just edited to confirm the patch landed — the result lists what changed, and verify covers the rest. " +
+	"AFTER FAILURE: never resend the same patch. The error quotes the closest actual text with line numbers; rebuild the context lines from that quote.\n" +
+	"\n" +
+	"EXAMPLE\n" +
+	"*** Begin Patch\n" +
+	"*** Add File: hello.txt\n" +
+	"+Hello world.\n" +
+	"*** Update File: example.txt\n" +
+	"@@\n" +
+	" Hello from the original text file.\n" +
+	"+Second line added.\n" +
+	"@@ old tail\n" +
+	"-old tail\n" +
+	"+new tail\n" +
+	"*** Delete File: obsolete.txt\n" +
+	"*** End Patch";
 export const APPLY_PATCH_LARK_GRAMMAR = `start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" LF
 end_patch: "*** End Patch" LF?
@@ -1685,7 +1771,8 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 		promptGuidelines: [
 			"Use apply_patch for file edits instead of mutating files through bash, Python scripts, heredocs, or shell redirection.",
 			"In *** Add File *** hunks there is no @@ line: every content line, including blank ones, must start with +.",
-		"An ambiguous anchor matches the FIRST occurrence; to edit a later duplicate block, extend the hunk with unique surrounding lines until the pattern matches only one place.",
+			"An ambiguous anchor matches the FIRST occurrence; to edit a later duplicate block, extend the hunk with unique surrounding lines until the pattern matches only one place.",
+			"Rename/remove/'everywhere'/'all files' → pass `verify` in the SAME call (mustNotContain the old name, mustContain the new one across a glob) instead of reading or grepping afterwards; a VERIFY_FAIL means the write happened but the invariant does not hold.",
 			"After apply_patch succeeds, do not re-read the edited files just to confirm the patch applied.",
 		],
 		async execute(
@@ -1774,12 +1861,23 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 				...(result.recoveryInstructions.noOps.length > 0
 					? [`No-op for: ${result.recoveryInstructions.noOps.join(", ")} (content was already identical).`]
 					: []),
+				...(normalizedParams.verifyDropped ? [IGNORED_VERIFY_LINE] : []),
 			];
+
+			const finalized = await finalizeSuccessfulPatch(ctx.cwd, result, normalizedParams.verify, postLines);
+			const details: ApplyPatchToolDetails = finalized.verification
+				? preview
+					? { preview, result, verification: finalized.verification }
+					: { result, verification: finalized.verification }
+				: preview
+					? { preview, result }
+					: { result };
 			return {
 				content: [
-					{ type: "text", text: postLines.length > 0 ? [...result.summaries, ...postLines].join("\n") : result.summaries.join("\n") },
+					{ type: "text", text: finalized.lines.join("\n") },
 				],
-				details: preview ? { preview, result } : { result },
+				...(finalized.isError ? { isError: true } : {}),
+				details,
 			};
 		},
 		renderCall(args, theme, context) {
@@ -1796,9 +1894,11 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 			const component = new Container();
 			const preview = result.details?.preview;
 			if (preview) {
+				const verifyFailed = (result.details?.verification?.failures.length ?? 0) > 0;
+				const patchFailed = (result.details?.result?.failures.length ?? 0) > 0;
 				const bgName = options.isPartial
 					? "toolPendingBg"
-					: result.details?.result && result.details.result.failures.length > 0
+					: patchFailed || verifyFailed
 						? "toolErrorBg"
 						: "toolSuccessBg";
 				const progress = result.details?.progress;
@@ -1806,9 +1906,11 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 					? `Applying patch (${progress.applied + progress.failed}/${progress.total})`
 					: options.isPartial
 						? "Applying patch"
-						: result.details?.result && result.details.result.failures.length > 0
+						: patchFailed
 							? "Patch partially failed"
-							: "Applied patch";
+							: verifyFailed
+								? "Patch applied, verification failed"
+								: "Applied patch";
 				const box = new Box(1, 1, (text: string) => applyLayeredBackground(theme, bgName, text));
 				box.addChild(new Text(theme.fg("toolTitle", theme.bold(title)), 0, 0));
 				box.addChild(new Spacer(1));
