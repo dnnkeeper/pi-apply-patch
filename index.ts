@@ -11,7 +11,7 @@ import {
 	type ToolDefinition,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import * as Diff from "diff";
 import { Type } from "typebox";
 import { type ContextLineIndex, type LineReplacement, replacementsAroundContext, SourceText } from "./line-endings.js";
@@ -206,8 +206,6 @@ type ApplyPatchRenderState = {
 	cwd: string;
 	patchText: string;
 	callText: string;
-	collapsed: string;
-	expanded: string;
 };
 
 type ApplyPatchThemeColor =
@@ -218,13 +216,11 @@ type ApplyPatchThemeColor =
 	| "toolDiffContext"
 	| "toolDiffRemoved"
 	| "toolOutput"
-	| "toolTitle";
-
-type ApplyPatchThemeBg = "toolErrorBg" | "toolPendingBg" | "toolSuccessBg";
+	| "toolTitle"
+	| "warning";
 
 type ApplyPatchTheme = {
 	fg: (name: ApplyPatchThemeColor, text: string) => string;
-	bg: (name: ApplyPatchThemeBg, text: string) => string;
 	bold: (text: string) => string;
 	inverse: (text: string) => string;
 };
@@ -240,26 +236,10 @@ export const PATCH_PREVIEW_MAX_CHARS = 4000;
 const PATCH_PREVIEW_HEAD_LINES = 8;
 const PATCH_PREVIEW_TAIL_LINES = PATCH_PREVIEW_MAX_LINES - PATCH_PREVIEW_HEAD_LINES - 1;
 const PATCH_PREVIEW_TRUNCATION_MARKER = "…";
+// Expanded output is the whole diff, but a huge patch must not push the conversation off screen.
+const PATCH_EXPANDED_MAX_LINES = 400;
+const PATCH_RENDER_INDENT = "  ";
 const applyPatchRenderStates = new Map<string, ApplyPatchRenderState>();
-
-function applyLayeredBackground(theme: ApplyPatchTheme, bgName: ApplyPatchThemeBg, text: string): string {
-	const marker = "\x1fpi-bg-marker\x1f";
-	const wrappedMarker = theme.bg(bgName, marker);
-	const markerIndex = wrappedMarker.indexOf(marker);
-	if (markerIndex === -1) {
-		return theme.bg(bgName, text);
-	}
-
-	const bgStart = wrappedMarker.slice(0, markerIndex);
-	const bgEnd = wrappedMarker.slice(markerIndex + marker.length);
-	const restored = text.replace(/\x1b\[([0-9;]*)m/g, (sequence: string, params: string) => {
-		if (params === "" || params.split(";").some((param) => param === "0" || param === "49")) {
-			return `${sequence}${bgStart}`;
-		}
-		return sequence;
-	});
-	return `${bgStart}${restored}${bgEnd}`;
-}
 
 function isChangedPreviewLine(line: string): boolean {
 	return /^[+-]\s*\d+\s/.test(line);
@@ -781,31 +761,7 @@ function getApplyPatchRenderState(toolCallId: string, cwd: string, patchText: st
 		return existing;
 	}
 
-	const callText = formatInFlightCallText(patchText);
-	let collapsed = "";
-	let expanded = "";
-	try {
-		const hunks = parsePatch(patchText);
-		if (hunks.length > 0) {
-			const files = hunks.map((hunk) => {
-				const file = {
-					filePath: hunk.filePath,
-					operation: hunk.type,
-					diff: "",
-					added: 0,
-					removed: 0,
-				} satisfies ApplyPatchPreviewFile;
-				return hunk.type === "update" && hunk.movePath !== undefined ? { ...file, movePath: hunk.movePath } : file;
-			}) satisfies ApplyPatchPreviewFile[];
-			const preview: ApplyPatchPreview = { files, added: 0, removed: 0 };
-			collapsed = formatPatchPreview(preview, cwd, false);
-			expanded = formatPatchPreview(preview, cwd, true);
-		}
-	} catch {
-		// leave summaries empty for partial/incomplete patch text
-	}
-
-	const nextState: ApplyPatchRenderState = { cwd, patchText, callText, collapsed, expanded };
+	const nextState: ApplyPatchRenderState = { cwd, patchText, callText: formatInFlightCallText(patchText) };
 	applyPatchRenderStates.set(toolCallId, nextState);
 	return nextState;
 }
@@ -814,14 +770,20 @@ export function clearApplyPatchRenderState(): void {
 	applyPatchRenderStates.clear();
 }
 
+const IN_FLIGHT_PATH_LIMIT = 3;
+
 export function formatInFlightCallText(patchText: string): string {
 	const paths = extractPatchedPaths(patchText);
 	if (paths.length === 0) {
 		return "Patching";
 	}
-	const noun = paths.length === 1 ? "file" : "files";
-	const count = paths.length > 1 ? ` (${paths.length} ${noun})` : "";
-	return `Patching${count}: ${paths.join(", ")}`;
+	const shown = paths.slice(0, IN_FLIGHT_PATH_LIMIT);
+	const omitted = paths.length - shown.length;
+	const suffix = omitted > 0 ? `, +${omitted} more` : "";
+	if (paths.length === 1) {
+		return `Patching ${paths[0]}`;
+	}
+	return `Patching ${paths.length} files: ${shown.join(", ")}${suffix}`;
 }
 
 type RenderableAddedDiffLine = { content: string; kind: "added"; lineNumber: string; sign: "+" };
@@ -860,7 +822,9 @@ function highlightDiffContent(content: string, filePath: string): string {
 	const plainContent = replaceTabs(content);
 	const language = getLanguageFromPath(filePath);
 	try {
-		return highlightCode(plainContent, language)[0] ?? plainContent;
+		const highlighted = highlightCode(plainContent, language);
+		// Real Pi returns one string per line; tolerate a plain string from older/stubbed builds.
+		return Array.isArray(highlighted) ? (highlighted[0] ?? plainContent) : highlighted;
 	} catch {
 		return plainContent;
 	}
@@ -913,7 +877,7 @@ function renderInlineDiff(
 	return { added, removed };
 }
 
-function renderOpenCodeLikeDiffLine(
+function renderDiffLine(
 	line: RenderableContentDiffLine,
 	filePath: string,
 	theme: ApplyPatchTheme,
@@ -924,17 +888,14 @@ function renderOpenCodeLikeDiffLine(
 		return `${theme.fg("toolDiffContext", line.sign)}${lineNumber} ${highlightDiffContent(line.content, filePath)}`;
 	}
 
+	// Changed lines are painted with the diff color as a whole. Syntax colors would win over it and
+	// hide the add/remove distinction, which is the one thing that must survive after a patch.
 	const diffColor = line.kind === "added" ? "toolDiffAdded" : "toolDiffRemoved";
-	const background = line.kind === "added" ? "toolSuccessBg" : "toolErrorBg";
-	const content =
-		contentOverride === undefined
-			? highlightDiffContent(line.content, filePath)
-			: theme.fg(diffColor, replaceTabs(contentOverride));
-	const rendered = `${theme.fg(diffColor, line.sign)}${lineNumber} ${content}`;
-	return theme.bg(background, rendered);
+	const content = theme.fg(diffColor, replaceTabs(contentOverride ?? line.content));
+	return `${theme.fg(diffColor, line.sign)}${lineNumber} ${content}`;
 }
 
-function renderOpenCodeLikeDiff(diffText: string, filePath: string, theme: ApplyPatchTheme): string {
+function renderDiff(diffText: string, filePath: string, theme: ApplyPatchTheme): string {
 	const parsedLines = diffText.split("\n").map(parseRenderableDiffLine);
 	const rendered: string[] = [];
 	let index = 0;
@@ -950,7 +911,7 @@ function renderOpenCodeLikeDiff(diffText: string, filePath: string, theme: Apply
 			rendered.push(
 				line.kind === "meta"
 					? theme.fg("toolDiffContext", line.text)
-					: renderOpenCodeLikeDiffLine(line, filePath, theme),
+					: renderDiffLine(line, filePath, theme),
 			);
 			index++;
 			continue;
@@ -974,89 +935,126 @@ function renderOpenCodeLikeDiff(diffText: string, filePath: string, theme: Apply
 			index++;
 		}
 
-		const pairedCount = Math.min(removedLines.length, addedLines.length);
-		for (let pairIndex = 0; pairIndex < pairedCount; pairIndex++) {
-			const removedLine = removedLines[pairIndex];
-			const addedLine = addedLines[pairIndex];
-			if (!removedLine || !addedLine) {
-				continue;
+		// Interleave only when the block is a one-to-one replacement, so the removed/added pairing is
+		// visually obvious. Uneven blocks keep the diff order (all removals, then all additions).
+		if (removedLines.length === addedLines.length) {
+			for (let pairIndex = 0; pairIndex < removedLines.length; pairIndex++) {
+				const removedLine = removedLines[pairIndex];
+				const addedLine = addedLines[pairIndex];
+				if (!removedLine || !addedLine) {
+					continue;
+				}
+
+				const inline = renderInlineDiff(removedLine.content, addedLine.content, theme);
+				rendered.push(renderDiffLine(removedLine, filePath, theme, inline.removed));
+				rendered.push(renderDiffLine(addedLine, filePath, theme, inline.added));
 			}
-
-			const inline = renderInlineDiff(removedLine.content, addedLine.content, theme);
-			rendered.push(renderOpenCodeLikeDiffLine(removedLine, filePath, theme, inline.removed));
-			rendered.push(renderOpenCodeLikeDiffLine(addedLine, filePath, theme, inline.added));
+			continue;
 		}
 
-		for (const removedLine of removedLines.slice(pairedCount)) {
-			rendered.push(renderOpenCodeLikeDiffLine(removedLine, filePath, theme));
+		for (const removedLine of removedLines) {
+			rendered.push(renderDiffLine(removedLine, filePath, theme));
 		}
-		for (const addedLine of addedLines.slice(pairedCount)) {
-			rendered.push(renderOpenCodeLikeDiffLine(addedLine, filePath, theme));
+		for (const addedLine of addedLines) {
+			rendered.push(renderDiffLine(addedLine, filePath, theme));
 		}
 	}
 
 	return rendered.join("\n");
 }
 
+function indentBlock(text: string, indent: string): string {
+	return text
+		.split("\n")
+		.map((line) => `${indent}${line}`)
+		.join("\n");
+}
+
+function formatPatchCounts(file: ApplyPatchPreviewFile, theme: ApplyPatchTheme): string {
+	const counts: string[] = [];
+	if (file.added > 0) {
+		counts.push(theme.fg("toolDiffAdded", `+${file.added}`));
+	}
+	if (file.removed > 0) {
+		counts.push(theme.fg("toolDiffRemoved", `-${file.removed}`));
+	}
+	return counts.length > 0 ? counts.join(" ") : theme.fg("muted", "no line changes");
+}
+
+function renderPatchFileHeader(file: ApplyPatchPreviewFile, cwd: string, theme: ApplyPatchTheme): string {
+	const isAdd = file.operation === "add";
+	const isDelete = file.operation === "delete";
+	const icon = isAdd ? "+" : isDelete ? "-" : "~";
+	const iconColor: ApplyPatchThemeColor = isAdd ? "toolDiffAdded" : isDelete ? "toolDiffRemoved" : "accent";
+	const label = isAdd ? "new" : isDelete ? "deleted" : file.movePath ? "moved" : "";
+	const labelText = label.length > 0 ? ` ${theme.fg("muted", label)}` : "";
+	return `${theme.fg(iconColor, icon)} ${theme.fg("accent", formatPatchFilePath(file, cwd))}${labelText} ${formatPatchCounts(file, theme)}`;
+}
+
+function countWindowMarkers(lines: string[]): number {
+	let markers = 0;
+	for (const line of lines) {
+		if (line === PATCH_PREVIEW_TRUNCATION_MARKER) {
+			markers++;
+		}
+	}
+	return markers;
+}
+
+/**
+ * The TUI diff view. Collapsed rows get a smart window of the first changed hunk per file (enough to
+ * recognize the edit without flooding the transcript); expanded rows get the whole diff, capped so a
+ * pathological patch cannot push everything else off screen.
+ */
 function renderPatchPreview(
 	preview: ApplyPatchPreview,
 	cwd: string,
 	theme: ApplyPatchTheme,
 	expanded: boolean,
 ): string {
-	if (expanded) {
-		try {
-			const renderFile = (file: ApplyPatchPreviewFile, headerPrefix: string): string => {
-				const header = formatPatchFileHeader(file, cwd);
-				if (!file.diff) {
-					return headerPrefix.length > 0 ? `${headerPrefix}${formatPatchFileSummary(file, cwd)}` : header;
-				}
-				const previewDiff = truncatePreview(file.diff);
-				const renderedDiff = renderOpenCodeLikeDiff(previewDiff, file.movePath ?? file.filePath, theme);
-				if (headerPrefix.length > 0) {
-					const nestedHeader = `${headerPrefix}${formatPatchFileSummary(file, cwd)}`;
-					return `${nestedHeader}\n${renderedDiff
-						.split("\n")
-						.map((line) => `    ${line}`)
-						.join("\n")}`;
-				}
-				return `${header}\n${renderedDiff}`;
-			};
-
-			if (preview.files.length === 1) {
-				const file = preview.files[0];
-				return file ? renderFile(file, "") : "";
-			}
-
-			const noun = "files";
-			const renderedFiles = preview.files.map((file) => renderFile(file, "  └ ")).join("\n");
-			if (renderedFiles.length > 0) {
-				return `• Edited ${preview.files.length} ${noun} ${formatLineCountSummary(preview.added, preview.removed)}\n${renderedFiles}`;
-			}
-		} catch {
-			// fall back to manual themed line rendering
-		}
+	if (preview.files.length === 0) {
+		return "";
 	}
 
-	return formatPatchPreview(preview, cwd, expanded)
-		.split("\n")
-		.map((line) => {
-			const trimmed = line.trimStart();
-			if (trimmed.startsWith("+")) {
-				return theme.fg("toolDiffAdded", line);
-			}
-			if (trimmed.startsWith("-")) {
-				return theme.fg("toolDiffRemoved", line);
-			}
-			if (trimmed.startsWith("•")) {
-				return theme.fg("toolTitle", theme.bold(line));
-			}
-			if (trimmed.startsWith("└")) {
-				return theme.fg("accent", line);
-			}
-			return theme.fg("toolDiffContext", line);
-		})
-		.join("\n");
+	const fileCount = Math.max(1, preview.files.length);
+	const collapsedBudget = Math.max(3, Math.floor(PATCH_PREVIEW_MAX_LINES / fileCount));
+	let expandedBudget = PATCH_EXPANDED_MAX_LINES;
+	const blocks: string[] = [];
+
+	for (const file of preview.files) {
+		const header = renderPatchFileHeader(file, cwd, theme);
+		const noLineChanges = file.added === 0 && file.removed === 0;
+		if (!file.diff || noLineChanges || (!expanded && file.operation === "delete")) {
+			blocks.push(header);
+			continue;
+		}
+
+		const totalLines = countLines(file.diff);
+		const windowText = expanded ? file.diff : truncatePreview(file.diff);
+		const windowLines = windowText.split("\n");
+		const limit = expanded ? expandedBudget : collapsedBudget;
+		const keptLines = windowLines.slice(0, Math.max(0, limit));
+		if (expanded) {
+			expandedBudget -= keptLines.length;
+		}
+
+		if (keptLines.length === 0) {
+			blocks.push(`${header}\n${theme.fg("muted", `${PATCH_RENDER_INDENT}… ${totalLines} diff line(s) hidden`)}`);
+			continue;
+		}
+
+		const renderedDiff = renderDiff(keptLines.join("\n"), file.movePath ?? file.filePath, theme);
+		const shownSourceLines = keptLines.length - countWindowMarkers(keptLines);
+		const hidden = Math.max(0, totalLines - shownSourceLines);
+		const block = [`${header}\n${indentBlock(renderedDiff, PATCH_RENDER_INDENT)}`];
+		if (hidden > 0) {
+			const hint = expanded ? "diff truncated" : "expand to view";
+			block.push(theme.fg("muted", `${PATCH_RENDER_INDENT}… ${hidden} more line(s) — ${hint}`));
+		}
+		blocks.push(block.join("\n"));
+	}
+
+	return blocks.join("\n\n");
 }
 
 function formatPendingPatchPaths(patchText: string): string {
@@ -1881,52 +1879,111 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 			};
 		},
 		renderCall(args, theme, context) {
+			const title = theme.fg("toolTitle", theme.bold("apply_patch"));
 			if (!context.argsComplete) {
-				return new Text(theme.fg("toolTitle", theme.bold("apply_patch: Patching")), 0, 0);
+				return new Text(`${title} ${theme.fg("muted", "patching…")}`, 0, 0);
 			}
 
 			const normalizedArgs = normalizeApplyPatchArguments(args);
 			const renderState = getApplyPatchRenderState(context.toolCallId, context.cwd, normalizedArgs.input);
-			const text = renderState.callText.length > 0 ? `apply_patch: ${renderState.callText}` : "apply_patch";
-			return new Text(theme.fg("toolTitle", theme.bold(text)), 0, 0);
+			if (renderState.callText.length === 0) {
+				return new Text(title, 0, 0);
+			}
+			return new Text(`${title} ${theme.fg("muted", `· ${renderState.callText}`)}`, 0, 0);
 		},
 		renderResult(result, options, theme, context) {
 			const component = new Container();
-			const preview = result.details?.preview;
-			if (preview) {
-				const verifyFailed = (result.details?.verification?.failures.length ?? 0) > 0;
-				const patchFailed = (result.details?.result?.failures.length ?? 0) > 0;
-				const bgName = options.isPartial
-					? "toolPendingBg"
-					: patchFailed || verifyFailed
-						? "toolErrorBg"
-						: "toolSuccessBg";
-				const progress = result.details?.progress;
-				const title = progress
-					? `Applying patch (${progress.applied + progress.failed}/${progress.total})`
-					: options.isPartial
-						? "Applying patch"
-						: patchFailed
+			component.addChild(new Spacer(1));
+			const details = result.details;
+			const preview = details?.preview;
+			const patchResult = details?.result;
+			const verification = details?.verification;
+			const failures = patchResult?.failures ?? [];
+			const verifyFailures = verification?.failures ?? [];
+			const patchFailed = failures.length > 0;
+			const verifyFailed = verifyFailures.length > 0;
+			const partialSuccess = patchResult?.hasPartialSuccess ?? false;
+			const progress = details?.progress;
+			const text = result.content
+				.filter((block) => block.type === "text")
+				.map((block) => (typeof block.text === "string" ? block.text : ""))
+				.filter((value) => value.length > 0)
+				.join("\n");
+
+			const title = progress
+				? `Applying patch (${progress.applied + progress.failed}/${progress.total})`
+				: options.isPartial
+					? "Applying patch"
+					: patchFailed
+						? partialSuccess
 							? "Patch partially failed"
-							: verifyFailed
-								? "Patch applied, verification failed"
-								: "Applied patch";
-				const box = new Box(1, 1, (text: string) => applyLayeredBackground(theme, bgName, text));
-				box.addChild(new Text(theme.fg("toolTitle", theme.bold(title)), 0, 0));
-				box.addChild(new Spacer(1));
-				const expanded = options.isPartial ? true : (options.expanded ?? true);
-				box.addChild(new Text(renderPatchPreview(preview, context.cwd, theme, expanded), 0, 0));
-				component.addChild(box);
+							: "Patch failed"
+						: verifyFailed
+							? "Patch applied · verification failed"
+							: "Applied patch";
+			component.addChild(new Text(theme.fg("toolTitle", theme.bold(title)), 0, 0));
+
+			if (!preview) {
+				if (!options.isPartial && text.length > 0) {
+					component.addChild(new Spacer(1));
+					component.addChild(new Text(theme.fg(context.isError ? "error" : "toolOutput", text), 0, 0));
+				}
 				return component;
 			}
 
-			const text = result.content
-				.filter((block) => block.type === "text")
-				.map((block) => block.text)
-				.filter((value) => typeof value === "string" && value.length > 0)
-				.join("\n");
-			if (text) {
-				component.addChild(new Text(theme.fg("toolOutput", text), 0, 0));
+			// A patch that failed before writing anything has no diff to show: the error is the output.
+			const showPreview = !patchFailed || partialSuccess;
+			if (showPreview) {
+				const appliedFiles = patchResult ? new Set(patchResult.appliedFiles) : undefined;
+				const files = appliedFiles
+					? preview.files.filter(
+							(file) =>
+								appliedFiles.has(file.filePath) ||
+								(file.movePath !== undefined && appliedFiles.has(file.movePath)),
+						)
+					: preview.files;
+				const body = renderPatchPreview({ ...preview, files }, context.cwd, theme, options.expanded);
+				if (body.length > 0) {
+					component.addChild(new Spacer(1));
+					component.addChild(new Text(body, 0, 0));
+				}
+			}
+
+			if (options.isPartial) {
+				return component;
+			}
+
+			if (patchFailed || verifyFailed) {
+				if (text.length > 0) {
+					component.addChild(new Spacer(1));
+					component.addChild(new Text(theme.fg("error", text), 0, 0));
+				}
+				return component;
+			}
+
+			// The long content string (summaries) is redundant with the headers; only the notices that
+			// are invisible elsewhere in the TUI are repeated here.
+			const warningLines = patchResult?.recoveryInstructions.warnings ?? [];
+			const mutedLines = [
+				...(patchResult && patchResult.recoveryInstructions.noOps.length > 0
+					? [
+							`No-op for: ${patchResult.recoveryInstructions.noOps.join(", ")} (content was already identical).`,
+						]
+					: []),
+				...(verification
+					? [
+							`VERIFY_OK checks=${verification.checks} files=${verification.scannedFiles}`,
+							...verification.warnings.map((warning) => `note: ${warning}`),
+						]
+					: []),
+			];
+			if (warningLines.length > 0) {
+				component.addChild(new Spacer(1));
+				component.addChild(new Text(theme.fg("warning", warningLines.join("\n")), 0, 0));
+			}
+			if (mutedLines.length > 0) {
+				component.addChild(new Spacer(1));
+				component.addChild(new Text(theme.fg("muted", mutedLines.join("\n")), 0, 0));
 			}
 			return component;
 		},

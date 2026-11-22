@@ -94,6 +94,33 @@ arrays, so this is the common real-world failure, and silence would be a lie.
 - **No-ops are reported.** A hunk that leaves the file byte-identical is reported as a no-op instead of a silent success.
 - **Atomic writes.** Files are written through a temp file plus rename, serialized per path, with a retry for the Windows `EPERM` case.
 
+### TUI output
+
+The tool row shows the diff that was applied, colour-coded, rather than just a summary:
+
+```
+ Applied patch
+
+ ~ src/api.ts +2 -1
+     10 export async function fetchUser(id: string) {
+   - 11   return request(id);
+   + 11   const user = await request(id);
+   + 12   return user;
+     13 }
+ + src/new.ts new +1
+   +  1 export const created = true;
+ - docs/old.md deleted -1
+```
+
+Added lines are green, removed lines red, context lines muted and syntax-highlighted, and changed
+tokens inside a replaced pair are highlighted. A collapsed row keeps a smart window around the first
+changed hunk; expanding it (`ctrl+o` or a click) shows the whole diff, capped at 400 lines. Headers
+distinguish `new`, `deleted` and `moved` files, and a blank line separates files.
+
+Failures are never hidden behind the diff: when nothing was written the intended diff is suppressed and
+the error text is shown in red; a partial failure shows only the files that were actually written, plus
+the failure reason. Ambiguity warnings, no-op notes and `VERIFY_OK` are printed under the diff.
+
 ### Prompt integration
 
 The description is written for a model that has never seen the tool: it states the envelope first, then
@@ -110,6 +137,7 @@ constrained by the Codex Lark grammar; everyone else gets the plain function too
 node lab/verify.test.mjs        # verify.ts: scopes, globs, needles, verdict formatting — 24 checks, no SDK
 node lab/description.test.mjs   # the description's worked example must apply; every rule it states must hold — 19 checks
 node lab/claims.test.mjs        # behavioural claims in the docs: rewrite routes, @@ anchors, verify gating — 9 checks
+node lab/render.test.mjs        # TUI renderer: diff colours, collapse/expand, visible failures — 28 checks
 node lab/e2e-jiti.test.mjs      # index.ts through jiti: real patch + verify round-trip — 14 checks
 ```
 
