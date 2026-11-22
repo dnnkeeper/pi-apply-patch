@@ -103,6 +103,12 @@ type ApplyPatchParams = {
 
 type ApplyPatchOperation = "add" | "delete" | "update";
 
+/** Per-call behaviour overrides; the extension resolves them from `apply-patch.json`. */
+export type ApplyPatchOptions = {
+	/** Reject (write nothing) when a chunk's pattern matches several places. Defaults to `true`. */
+	rejectAmbiguous?: boolean;
+};
+
 type ApplyPatchPreviewFile = {
 	filePath: string;
 	movePath?: string;
@@ -382,6 +388,7 @@ export const APPLY_PATCH_FREEFORM_DESCRIPTION =
 	"'*** End of File' as the last line of a block means 'anchor at the end of the file'.\n" +
 	"- context lines must be copied VERBATIM from the file, indentation and trailing spaces included: the patch matches text, it does not paraphrase. Include 3 lines of surrounding context so the anchor is unique.\n" +
 	"- hunks apply top-to-bottom, each against the result of the previous one; a later hunk sees earlier edits.\n" +
+	"- duplicate anchors are rejected before writing: add unique context, or use '*** End of File' for the last occurrence.\n" +
 	"- a whole-file rewrite is either Delete File now + Add File in a later call, or one Update File whose '-' lines are the entire old content.\n" +
 	"\n" +
 	"AFTER SUCCESS: do not re-read the files you just edited to confirm the patch landed — the result lists what changed, and verify covers the rest. " +
@@ -520,10 +527,10 @@ function seekSequence(
 	return undefined;
 }
 
-/** Number of exact full-file occurrences of the pattern; 0 when the pattern is empty. */
-function countExactMatches(lines: string[], pattern: string[]): number {
-	if (pattern.length === 0) return 0;
-	let count = 0;
+/** 0-based start indices of every exact full-file occurrence of the pattern. */
+function findExactMatches(lines: string[], pattern: string[]): number[] {
+	if (pattern.length === 0) return [];
+	const matches: number[] = [];
 	for (let index = 0; index + pattern.length <= lines.length; index++) {
 		let matched = true;
 		for (let patternIndex = 0; patternIndex < pattern.length; patternIndex++) {
@@ -532,9 +539,9 @@ function countExactMatches(lines: string[], pattern: string[]): number {
 				break;
 			}
 		}
-		if (matched) count++;
+		if (matched) matches.push(index);
 	}
-	return count;
+	return matches;
 }
 
 const FILE_HEADER_MARKERS = [
@@ -1085,7 +1092,9 @@ async function createPatchPreview(cwd: string, hunks: ParsedPatch[]): Promise<Ap
 
 		const oldContent = await readFile(absolutePath, "utf-8");
 		const newContent =
-			hunk.chunks.length === 0 ? oldContent : replaceChunks(oldContent, hunk.filePath, hunk.chunks).content;
+			// The preview is speculative and must not throw on an ambiguity the real run will either
+			// reject (and then hide) or resolve to the first match.
+			hunk.chunks.length === 0 ? oldContent : replaceChunks(oldContent, hunk.filePath, hunk.chunks, false).content;
 		if (hunk.movePath) {
 			await resolvePatchPath(cwd, hunk.movePath);
 		}
@@ -1275,10 +1284,21 @@ function parseNonEmptyPatch(patchText: string): ParsedPatch[] {
 	throw new PatchParseError("apply_patch verification failed: no hunks found");
 }
 
+function formatAmbiguousAnchor(filePath: string, pattern: string[], matchLines: number[]): string {
+	const shown = matchLines.slice(0, 6).join(", ");
+	const more = matchLines.length > 6 ? `, +${matchLines.length - 6} more` : "";
+	return [
+		`Ambiguous anchor in ${filePath}: the ${pattern.length}-line hunk matches ${matchLines.length} places (lines ${shown}${more}), so nothing was written.`,
+		`First matching line: ${truncateMatchLine(pattern[0] ?? "")}`,
+		`Fix: copy unique surrounding context into the hunk so it matches exactly one place, or add '*** End of File' when the LAST occurrence is intended.`,
+	].join("\n");
+}
+
 function replaceChunks(
 	content: string,
 	filePath: string,
 	chunks: PatchChunk[],
+	rejectAmbiguous: boolean,
 ): { content: string; fuzz: number; matches: number; firstMatchLine?: number } {
 	// Chunks apply SEQUENTIALLY: each chunk is matched against the content produced by the
 	// previous chunk. This makes dependent hunks (-one/+ONE, then -ONE/+ONE-CHAIN) valid and
@@ -1286,9 +1306,8 @@ function replaceChunks(
 	// preferred ending, untouched lines keep theirs (SourceText re-parsed at every step).
 	let current = content;
 	let fuzz = 0;
-	let matches = 0;
-	let firstMatchLine: number | undefined;
-	let patternOccurrences = 0;
+	let ambiguousMatches = 0;
+	let ambiguousLine: number | undefined;
 
 	for (const chunk of chunks) {
 		const source = SourceText.parse(current);
@@ -1313,8 +1332,7 @@ function replaceChunks(
 		let pattern = chunk.oldLines;
 		let newLines = chunk.newLines;
 		// Search always starts at 0 on the CURRENT content: the patch orders chunks by intent,
-		// and every earlier chunk is already materialized. Occurrence counting (for the
-		// ambiguity warning) uses the ORIGINAL file content and the first real pattern.
+		// and every earlier chunk is already materialized.
 		let foundAt = seekSequence(originalLines, pattern, 0, chunk.isEndOfFile);
 		if (foundAt === undefined && pattern[pattern.length - 1] === "") {
 			pattern = pattern.slice(0, -1);
@@ -1329,11 +1347,26 @@ function replaceChunks(
 		}
 
 		fuzz += foundAt.fuzz;
-		if (matches === 0) {
-			firstMatchLine = foundAt.index + 1;
-			patternOccurrences = countExactMatches(originalLines, pattern);
+		// `*** End of File` is an explicit choice of the last occurrence, so duplicate matches
+		// elsewhere are not ambiguous there. Every other duplicate is unsafe by default.
+		if (!chunk.isEndOfFile) {
+			const occurrences = findExactMatches(originalLines, pattern);
+			if (occurrences.length > 1) {
+				if (rejectAmbiguous) {
+					throw new PatchApplicationError(
+						formatAmbiguousAnchor(
+							filePath,
+							pattern,
+							occurrences.map((index) => index + 1),
+						),
+					);
+				}
+				if (occurrences.length > ambiguousMatches) {
+					ambiguousMatches = occurrences.length;
+					ambiguousLine = foundAt.index + 1;
+				}
+			}
 		}
-		matches++;
 		// Sequential rewrite of the matched region. Context lines inside the chunk are already
 		// part of `pattern`; a plain span replacement keeps their exact text and endings, and
 		// inserted lines take the file's preferred ending via source.replace.
@@ -1345,8 +1378,8 @@ function replaceChunks(
 	return {
 		content: current,
 		fuzz,
-		matches: Math.max(1, patternOccurrences),
-		firstMatchLine,
+		matches: Math.max(1, ambiguousMatches),
+		firstMatchLine: ambiguousLine,
 	};
 }
 
@@ -1354,6 +1387,7 @@ async function applySingleHunk(
 	cwd: string,
 	hunk: ParsedPatch,
 	dryRun = false,
+	options: ApplyPatchOptions = {},
 ): Promise<{ summary: string; appliedFile: string; fuzz: number; matches: number; firstMatchLine?: number; noOp: boolean }> {
 	const absolutePath = await resolvePatchPath(cwd, hunk.filePath);
 	const absoluteMovePath =
@@ -1395,7 +1429,7 @@ async function applySingleHunk(
 		const chunkResult =
 			hunk.chunks.length === 0
 				? { content: currentContent, fuzz: 0, matches: 1, firstMatchLine: undefined }
-				: replaceChunks(currentContent, hunk.filePath, hunk.chunks);
+				: replaceChunks(currentContent, hunk.filePath, hunk.chunks, options.rejectAmbiguous ?? true);
 		const nextContent = chunkResult.content;
 
 		if (hunk.movePath && absoluteMovePath) {
@@ -1435,14 +1469,16 @@ export async function applyPatchDetailed(
 	cwd: string,
 	patchText: string,
 	onProgress?: ApplyPatchProgressCallback,
+	options?: ApplyPatchOptions,
 ): Promise<ApplyPatchResult> {
-	return applyParsedPatchDetailed(cwd, parseNonEmptyPatch(patchText), onProgress);
+	return applyParsedPatchDetailed(cwd, parseNonEmptyPatch(patchText), onProgress, options);
 }
 
 async function applyParsedPatchDetailed(
 	cwd: string,
 	hunks: ParsedPatch[],
 	onProgress?: ApplyPatchProgressCallback,
+	options: ApplyPatchOptions = {},
 ): Promise<ApplyPatchResult> {
 	const summaries: string[] = [];
 	const appliedFiles: string[] = [];
@@ -1455,7 +1491,7 @@ async function applyParsedPatchDetailed(
 	const validationFailures: ApplyPatchFailure[] = [];
 	for (const hunk of hunks) {
 		try {
-			await applySingleHunk(cwd, hunk, true);
+			await applySingleHunk(cwd, hunk, true, options);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			const code =
@@ -1480,7 +1516,7 @@ async function applyParsedPatchDetailed(
 
 	for (const hunk of hunks) {
 		try {
-			const { summary, appliedFile, fuzz: hunkFuzz, matches, firstMatchLine, noOp } = await applySingleHunk(cwd, hunk);
+			const { summary, appliedFile, fuzz: hunkFuzz, matches, firstMatchLine, noOp } = await applySingleHunk(cwd, hunk, false, options);
 			summaries.push(summary);
 			appliedFiles.push(appliedFile);
 			fuzz += hunkFuzz;
@@ -1540,14 +1576,14 @@ function createRecoveryInstructions(
 	};
 }
 
-export async function applyPatch(cwd: string, patchText: string): Promise<string[]> {
+export async function applyPatch(cwd: string, patchText: string, options?: ApplyPatchOptions): Promise<string[]> {
 	const hunks = parseNonEmptyPatch(patchText);
 
 	const summaries: string[] = [];
 	const appliedFiles: string[] = [];
 	for (const hunk of hunks) {
 		try {
-			const { summary, appliedFile } = await applySingleHunk(cwd, hunk);
+			const { summary, appliedFile } = await applySingleHunk(cwd, hunk, false, options);
 			summaries.push(summary);
 			appliedFiles.push(appliedFile);
 		} catch (error) {
@@ -1632,11 +1668,26 @@ export const APPLY_PATCH_TOOLSETS: readonly ApplyPatchToolset[] = ["additive", "
 
 const DEFAULT_APPLY_PATCH_TOOLSET: ApplyPatchToolset = "additive";
 
+/**
+ * What to do when a chunk's context lines match several places in the file.
+ * - `reject` (default): fail before writing anything and name the duplicate lines.
+ * - `first`: apply at the first occurrence and report an ambiguity warning.
+ */
+export type ApplyPatchAmbiguity = "reject" | "first";
+
+export const APPLY_PATCH_AMBIGUITIES: readonly ApplyPatchAmbiguity[] = ["reject", "first"];
+
+export const DEFAULT_APPLY_PATCH_AMBIGUITY: ApplyPatchAmbiguity = "reject";
+
 /** User-level config file: `~/.pi/agent/apply-patch.json`. */
-const TOOLSET_FILE_NAME = "apply-patch.json";
+const CONFIG_FILE_NAME = "apply-patch.json";
 
 export function isApplyPatchToolset(value: unknown): value is ApplyPatchToolset {
 	return value === "additive" || value === "replace" || value === "off";
+}
+
+export function isApplyPatchAmbiguity(value: unknown): value is ApplyPatchAmbiguity {
+	return value === "reject" || value === "first";
 }
 
 function resolveAgentDir(): string {
@@ -1654,26 +1705,41 @@ function resolveAgentDir(): string {
 }
 
 export function applyPatchConfigPath(): string {
-	return path.join(resolveAgentDir(), TOOLSET_FILE_NAME);
+	return path.join(resolveAgentDir(), CONFIG_FILE_NAME);
+}
+
+/** Raw config object; unreadable or malformed files are treated as empty. */
+async function readApplyPatchConfigObject(): Promise<Record<string, unknown>> {
+	try {
+		const parsed: unknown = JSON.parse(await readFile(applyPatchConfigPath(), "utf-8"));
+		return parsed !== null && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+	} catch {
+		return {};
+	}
 }
 
 /** Read the configured toolset. A missing or malformed file falls back to `additive`. */
 export async function readApplyPatchToolset(): Promise<ApplyPatchToolset> {
-	try {
-		const parsed: unknown = JSON.parse(await readFile(applyPatchConfigPath(), "utf-8"));
-		if (parsed !== null && typeof parsed === "object" && "toolset" in parsed && isApplyPatchToolset(parsed.toolset)) {
-			return parsed.toolset;
-		}
-	} catch {
-		// Missing file or invalid JSON: keep the default.
-	}
-	return DEFAULT_APPLY_PATCH_TOOLSET;
+	const config = await readApplyPatchConfigObject();
+	return isApplyPatchToolset(config.toolset) ? config.toolset : DEFAULT_APPLY_PATCH_TOOLSET;
+}
+
+/** Read the configured ambiguity policy. Missing or malformed falls back to `reject`. */
+export async function readApplyPatchAmbiguity(): Promise<ApplyPatchAmbiguity> {
+	const config = await readApplyPatchConfigObject();
+	return isApplyPatchAmbiguity(config.ambiguous) ? config.ambiguous : DEFAULT_APPLY_PATCH_AMBIGUITY;
+}
+
+/** Merge keys into the config file, preserving every key this version does not know about. */
+export async function writeApplyPatchConfig(patch: Record<string, unknown>): Promise<void> {
+	const filePath = applyPatchConfigPath();
+	const next = { ...(await readApplyPatchConfigObject()), ...patch };
+	await mkdir(path.dirname(filePath), { recursive: true });
+	await writeFileAtomic(filePath, `${JSON.stringify(next, null, 2)}\n`);
 }
 
 export async function writeApplyPatchToolset(toolset: ApplyPatchToolset): Promise<void> {
-	const filePath = applyPatchConfigPath();
-	await mkdir(path.dirname(filePath), { recursive: true });
-	await writeFileAtomic(filePath, `${JSON.stringify({ toolset }, null, 2)}\n`);
+	await writeApplyPatchConfig({ toolset });
 }
 
 function isExtensionManagedTool(toolName: string): boolean {
@@ -1769,7 +1835,7 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 		promptGuidelines: [
 			"Use apply_patch for file edits instead of mutating files through bash, Python scripts, heredocs, or shell redirection.",
 			"In *** Add File *** hunks there is no @@ line: every content line, including blank ones, must start with +.",
-			"An ambiguous anchor matches the FIRST occurrence; to edit a later duplicate block, extend the hunk with unique surrounding lines until the pattern matches only one place.",
+			"An anchor that matches several places is unsafe: extend the hunk with unique surrounding lines until the pattern matches exactly one place. Use '*** End of File' to target the last occurrence explicitly.",
 			"Rename/remove/'everywhere'/'all files' → pass `verify` in the SAME call (mustNotContain the old name, mustContain the new one across a glob) instead of reading or grepping afterwards; a VERIFY_FAIL means the write happened but the invariant does not hold.",
 			"After apply_patch succeeds, do not re-read the edited files just to confirm the patch applied.",
 		],
@@ -1806,6 +1872,7 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 			});
 
 			const preview = pendingUpdate.details?.preview;
+			const rejectAmbiguous = (await readApplyPatchAmbiguity()) === "reject";
 			const result = await applyParsedPatchDetailed(
 				ctx.cwd,
 				parsedHunks ?? parseNonEmptyPatch(normalizedParams.input),
@@ -1822,6 +1889,7 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 						details: progressUpdate.details,
 					});
 				},
+				{ rejectAmbiguous },
 			);
 			if (result.failures.length > 0) {
 				const failureLines = result.failures.map(
@@ -1903,6 +1971,7 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 			const patchFailed = failures.length > 0;
 			const verifyFailed = verifyFailures.length > 0;
 			const partialSuccess = patchResult?.hasPartialSuccess ?? false;
+			const ambiguousFailure = failures.some((failure) => failure.message.startsWith("Ambiguous anchor"));
 			const progress = details?.progress;
 			const text = result.content
 				.filter((block) => block.type === "text")
@@ -1917,7 +1986,9 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 					: patchFailed
 						? partialSuccess
 							? "Patch partially failed"
-							: "Patch failed"
+							: ambiguousFailure
+								? "Patch rejected · ambiguous anchor"
+								: "Patch failed"
 						: verifyFailed
 							? "Patch applied · verification failed"
 							: "Applied patch";
@@ -1998,6 +2069,12 @@ export function createApplyPatchTool(): ApplyPatchToolDefinition {
 	});
 }
 
+function describeAmbiguity(ambiguity: ApplyPatchAmbiguity): string {
+	return ambiguity === "reject"
+		? "reject - a pattern that matches several places fails the patch before writing"
+		: "first - a pattern that matches several places edits the first one and reports a warning";
+}
+
 export function registerApplyPatchExtension(pi: ApplyPatchExtensionAPI): void {
 	pi.registerTool(createApplyPatchTool());
 
@@ -2014,19 +2091,45 @@ export function registerApplyPatchExtension(pi: ApplyPatchExtensionAPI): void {
 	});
 
 	pi.registerCommand("apply-patch", {
-		description: "Choose the file-editing toolset: additive (apply_patch + edit/write), replace, off, or status",
-		getArgumentCompletions: (argumentPrefix) =>
-			APPLY_PATCH_TOOLSETS.filter((toolset) => toolset.startsWith(argumentPrefix.trim())).map((toolset) => ({
+		description:
+			"Choose the file-editing toolset (additive/replace/off) or the ambiguous-anchor policy (reject/first)",
+		getArgumentCompletions: (argumentPrefix) => {
+			const trimmed = argumentPrefix.trimStart();
+			const [head, ...rest] = trimmed.split(/\s+/);
+			if (head === "ambiguity") {
+				const valuePrefix = (rest[0] ?? "").trim();
+				return APPLY_PATCH_AMBIGUITIES.filter((ambiguity) => ambiguity.startsWith(valuePrefix)).map(
+					(ambiguity) => ({
+						value: `ambiguity ${ambiguity}`,
+						label: ambiguity,
+						description: describeAmbiguity(ambiguity),
+					}),
+				);
+			}
+			const completions: Array<{ value: string; label: string; description: string }> = APPLY_PATCH_TOOLSETS.filter(
+				(toolset) => toolset.startsWith(trimmed),
+			).map((toolset) => ({
 				value: toolset,
 				label: toolset,
 				description: describeToolset(toolset),
-			})),
+			}));
+			if ("ambiguity".startsWith(trimmed)) {
+				completions.push({
+					value: "ambiguity ",
+					label: "ambiguity",
+					description: "Ambiguous-anchor policy: reject (default) or first",
+				});
+			}
+			return completions;
+		},
 		handler: async (args, ctx) => {
 			const requested = args.trim().toLowerCase();
-			const report = (toolset: ApplyPatchToolset) => {
+			const report = async (toolset: ApplyPatchToolset) => {
+				const ambiguity = await readApplyPatchAmbiguity();
 				ctx.ui.notify(
 					[
 						`toolset: ${describeToolset(toolset)}`,
+						`ambiguity: ${describeAmbiguity(ambiguity)}`,
 						`active tools: ${pi.getActiveTools().join(", ")}`,
 						`config: ${applyPatchConfigPath()}`,
 					].join("\n"),
@@ -2034,10 +2137,37 @@ export function registerApplyPatchExtension(pi: ApplyPatchExtensionAPI): void {
 				);
 			};
 
+			if (requested === "ambiguity" || requested.startsWith("ambiguity ")) {
+				const values = requested.split(/\s+/);
+				const value = values[1];
+				if (value === undefined || value === "status") {
+					const current = await readApplyPatchAmbiguity();
+					ctx.ui.notify(
+						[
+							`ambiguity: ${describeAmbiguity(current)}`,
+							`config: ${applyPatchConfigPath()}`,
+							"set it with /apply-patch ambiguity reject or /apply-patch ambiguity first",
+						].join("\n"),
+						"info",
+					);
+					return;
+				}
+				if (!isApplyPatchAmbiguity(value)) {
+					ctx.ui.notify(
+						`Unknown ambiguity policy "${value}". Use one of: ${APPLY_PATCH_AMBIGUITIES.join(", ")}.`,
+						"warning",
+					);
+					return;
+				}
+				await writeApplyPatchConfig({ ambiguous: value });
+				ctx.ui.notify(`ambiguity: ${describeAmbiguity(value)}\nconfig: ${applyPatchConfigPath()}`, "info");
+				return;
+			}
+
 			if (requested === "" || requested === "status") {
 				const current = await readApplyPatchToolset();
 				if (requested === "status") {
-					report(current);
+					await report(current);
 					return;
 				}
 				const labels = APPLY_PATCH_TOOLSETS.map((toolset) => describeToolset(toolset));
@@ -2047,11 +2177,11 @@ export function registerApplyPatchExtension(pi: ApplyPatchExtensionAPI): void {
 				]);
 				const pickedToolset = APPLY_PATCH_TOOLSETS.find((toolset) => picked?.startsWith(toolset));
 				if (pickedToolset === undefined) {
-					report(current);
+					await report(current);
 					return;
 				}
 				await writeApplyPatchToolset(pickedToolset);
-				report(await syncToolset(pi, pickedToolset));
+				await report(await syncToolset(pi, pickedToolset));
 				return;
 			}
 
@@ -2064,7 +2194,7 @@ export function registerApplyPatchExtension(pi: ApplyPatchExtensionAPI): void {
 			}
 
 			await writeApplyPatchToolset(requested);
-			report(await syncToolset(pi, requested));
+			await report(await syncToolset(pi, requested));
 		},
 	});
 }

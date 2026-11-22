@@ -30,8 +30,13 @@ check("Update File rewrite works", rewrite.failures.length === 0, JSON.stringify
 await writeFile(path.join(ROOT, "h.txt"), "alpha\nneedle\nalpha\n");
 const badHint = await applyPatchDetailed(ROOT, P("*** Update File: h.txt\n@@ not_a_real_line\n-alpha\n+ALPHA\n"));
 check("a non-existent @@ anchor is rejected", badHint.failures.length === 1 && /Failed to find context/.test(badHint.failures[0].message), JSON.stringify(badHint.failures));
-const goodHint = await applyPatchDetailed(ROOT, P("*** Update File: h.txt\n@@ needle\n-alpha\n+ALPHA\n"));
-check("an existing @@ anchor is accepted", goodHint.failures.length === 0, JSON.stringify(goodHint.failures));
+// The removal line is ambiguous here (alpha appears twice), so the default policy refuses it.
+const ambiguousHint = await applyPatchDetailed(ROOT, P("*** Update File: h.txt\n@@ needle\n-alpha\n+ALPHA\n"));
+check("an ambiguous removal is rejected by default", ambiguousHint.failures.length === 1 && /Ambiguous anchor/.test(ambiguousHint.failures[0].message), JSON.stringify(ambiguousHint.failures));
+const goodHint = await applyPatchDetailed(ROOT, P("*** Update File: h.txt\n@@ needle\n-alpha\n+ALPHA\n"), undefined, {
+	rejectAmbiguous: false,
+});
+check("an existing @@ anchor is accepted with ambiguous=first", goodHint.failures.length === 0, JSON.stringify(goodHint.failures));
 // Claim: "@@ <text>" must exist, but does NOT steer placement — the removal lines decide that.
 check("@@ anchor does not move the edit (removal lines decide)", (await readFile(path.join(ROOT, "h.txt"), "utf-8")) === "ALPHA\nneedle\nalpha\n");
 

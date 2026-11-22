@@ -225,5 +225,30 @@ const smallPreview = {
 	check("no-op notice is visible", out.includes("No-op for: src/same.ts"), out);
 }
 
+// 9. An ambiguous rejection gets its own title and does not show the intended diff.
+{
+	const out = render(
+		{
+			preview: smallPreview,
+			result: patchResult({
+				failures: [
+					{
+						filePath: "src/a.ts",
+						operation: "update",
+						message: "Ambiguous anchor in src/a.ts: the 1-line hunk matches 2 places (lines 2, 5), so nothing was written.",
+					},
+				],
+			}),
+		},
+		{
+			content:
+				"apply_patch failed.\nFailed:\n- src/a.ts (update): Ambiguous anchor in src/a.ts: the 1-line hunk matches 2 places (lines 2, 5), so nothing was written.",
+		},
+	);
+	check("ambiguous rejection title", out.includes("Patch rejected · ambiguous anchor"), out);
+	check("ambiguous rejection hides the diff", !out.includes("newName"), out);
+	check("ambiguous rejection shows why", out.includes("matches 2 places"), out);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -90,7 +90,7 @@ arrays, so this is the common real-world failure, and silence would be a lie.
 - **Failures are real errors.** A rejected or partially applied patch returns the tool result with `isError: true`, so codemode scripts and other callers see a rejected promise instead of a success string containing "failed".
 - **Nothing is written when a hunk does not match.** On a context mismatch the tool reports the closest matching window (1-based line number, matched/total lines, match percent), shows only the differing expected/actual line pairs, and gives explicit accept/decline guidance.
 - **No silent overwrite.** `Add File` onto an existing path is rejected together with the whole patch; use `Update File`, or `Delete File` first.
-- **Ambiguity is reported.** When a chunk matches several places, the result says so, with the occurrence count and the line the edit landed on.
+- **Ambiguity is rejected.** By default, a chunk whose context lines match several places fails the whole patch before anything is written, and the error lists the duplicate line numbers. Set `ambiguous: "first"` to restore legacy behaviour: apply at the first match and emit a warning.
 - **No-ops are reported.** A hunk that leaves the file byte-identical is reported as a no-op instead of a silent success.
 - **Atomic writes.** Files are written through a temp file plus rename, serialized per path, with a retry for the Windows `EPERM` case.
 
@@ -119,7 +119,9 @@ distinguish `new`, `deleted` and `moved` files, and a blank line separates files
 
 Failures are never hidden behind the diff: when nothing was written the intended diff is suppressed and
 the error text is shown in red; a partial failure shows only the files that were actually written, plus
-the failure reason. Ambiguity warnings, no-op notes and `VERIFY_OK` are printed under the diff.
+the failure reason. An ambiguous anchor is rejected as `Patch rejected · ambiguous anchor` with the
+duplicate line numbers instead of a diff; in `ambiguous: "first"` mode the warning appears under the
+diff. No-op notes and `VERIFY_OK` are printed there too.
 
 ### Prompt integration
 
@@ -127,17 +129,18 @@ The description is written for a model that has never seen the tool: it states t
 the line rules where patches actually fail (one `' '`/`-`/`+` per line, no unified-diff ranges, verbatim
 context, top-to-bottom chunk order), then `verify`, then a full multi-hunk example, and ends with the two
 anti-patterns — re-reading files to confirm a patch, and retrying a failed patch unchanged. Prompt
-guidelines add the short forms (Add File has no `@@`; an ambiguous anchor matches the first occurrence;
-use `verify` instead of a follow-up grep). On providers that support OpenAI grammar tools the patch is
-constrained by the Codex Lark grammar; everyone else gets the plain function tool.
+guidelines add the short forms (Add File has no `@@`; duplicate anchors must be disambiguated or
+rejected; use `verify` instead of a follow-up grep). On providers that support OpenAI grammar tools the
+patch is constrained by the Codex Lark grammar; everyone else gets the plain function tool.
 
 ## Tests
 
 ```sh
-node lab/verify.test.mjs        # verify.ts: scopes, globs, needles, verdict formatting — 24 checks, no SDK
-node lab/description.test.mjs   # the description's worked example must apply; every rule it states must hold — 19 checks
-node lab/claims.test.mjs        # behavioural claims in the docs: rewrite routes, @@ anchors, verify gating — 9 checks
-node lab/render.test.mjs        # TUI renderer: diff colours, collapse/expand, visible failures — 28 checks
+node lab/verify.test.mjs        # verify.ts: scopes, globs, needles, verdict formatting — 30 checks, no SDK
+node lab/description.test.mjs   # the description's worked example must apply; every rule it states must hold — 23 checks
+node lab/claims.test.mjs        # behavioural claims in the docs: rewrite routes, @@ anchors, verify gating — 11 checks
+node lab/ambiguity.test.mjs     # ambiguous-anchor policy, execute wiring and config-file merging — 26 checks
+node lab/render.test.mjs        # TUI renderer: diff colours, collapse/expand, visible failures — 31 checks
 node lab/e2e-jiti.test.mjs      # index.ts through jiti: real patch + verify round-trip — 14 checks
 ```
 
@@ -163,10 +166,13 @@ Which file-editing tools the model sees is a setting, switchable inside a sessio
 
 ```
 /apply-patch                     # pick from a list
-/apply-patch status              # current mode, active tools, config path
+/apply-patch status              # current modes, active tools, config path
 /apply-patch additive
 /apply-patch replace
 /apply-patch off
+/apply-patch ambiguity            # show the current ambiguous-anchor policy
+/apply-patch ambiguity reject     # default: duplicate anchors fail the patch
+/apply-patch ambiguity first      # legacy: edit the first match and warn
 ```
 
 Argument completion is available (`/apply-patch rep<Tab>`). A change applies immediately — no `/reload` — and prints the mode, the resulting active tools and the config path. An unknown argument is rejected with a warning and changes nothing.
@@ -177,11 +183,23 @@ The mode is read from `<agent-dir>/apply-patch.json` (usually `~/.pi/agent/apply
 
 ```json
 {
-  "toolset": "additive"
+  "toolset": "additive",
+  "ambiguous": "reject"
 }
 ```
 
-`/apply-patch <mode>` rewrites this file, so the choice is global for new sessions too. A missing or malformed file falls back to `additive`. The extension re-applies the mode on `session_start`, on model switch, and before every agent run, so it also corrects a tool set restored from an old session transcript.
+`/apply-patch <mode>` rewrites this file, so the choice is global for new sessions too. A missing or malformed file falls back to `additive` / `reject`. The extension re-applies the mode on `session_start`, on model switch, and before every agent run, so it also corrects a tool set restored from an old session transcript.
+
+### Ambiguous anchors
+
+`ambiguous` controls what happens when a chunk's `-`/` ` lines match several places in the file:
+
+| Value | Behaviour |
+| --- | --- |
+| `reject` (default) | The whole patch fails before anything is written. The error names the duplicate line numbers and asks for unique context. |
+| `first` | The chunk edits the first match and the result carries an ambiguity warning with the occurrence count and the line used. |
+
+`*** End of File` is an explicit request for the last occurrence, so duplicate matches elsewhere do not count as ambiguous there. The policy is read for every `apply_patch` call, so a `/apply-patch ambiguity …` change applies immediately.
 
 ## Install
 
