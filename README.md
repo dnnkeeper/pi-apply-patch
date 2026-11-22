@@ -123,6 +123,12 @@ the failure reason. An ambiguous anchor is rejected as `Patch rejected · ambigu
 duplicate line numbers instead of a diff; in `ambiguous: "first"` mode the warning appears under the
 diff. No-op notes and `VERIFY_OK` are printed there too.
 
+The preview is a hunked diff, not the file: only changed lines plus 3 lines of context are kept, so a
+one-line edit in a 5000-line file previews as a handful of lines and the edit is never hidden behind
+unchanged context. Add/delete previews of huge files are capped at 400 lines / 50 KB per file with an
+explicit `… N more diff line(s)` marker, and a single very long line is truncated to 500 characters.
+The model still receives only the summary lines; the diff is display metadata.
+
 ### Prompt integration
 
 The description is written for a model that has never seen the tool: it states the envelope first, then
@@ -140,6 +146,7 @@ node lab/verify.test.mjs        # verify.ts: scopes, globs, needles, verdict for
 node lab/description.test.mjs   # the description's worked example must apply; every rule it states must hold — 23 checks
 node lab/claims.test.mjs        # behavioural claims in the docs: rewrite routes, @@ anchors, verify gating — 11 checks
 node lab/ambiguity.test.mjs     # ambiguous-anchor policy, execute wiring and config-file merging — 26 checks
+node lab/preview.test.mjs       # preview bounds: hunked diff, large add/delete caps, long lines — 16 checks
 node lab/render.test.mjs        # TUI renderer: diff colours, collapse/expand, failures, CRLF — 35 checks
 node lab/e2e-jiti.test.mjs      # index.ts through jiti: real patch + verify round-trip — 14 checks
 ```

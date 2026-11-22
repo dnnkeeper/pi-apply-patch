@@ -623,12 +623,25 @@ export function extractPatchedPaths(patchText: string): string[] {
 	});
 }
 
+const PATCH_PREVIEW_CONTEXT_LINES = 3;
+// A preview must stay bounded even for a whole-file rewrite: the diff is display-only, and storing
+// the full text of a large file in the tool result inflates the session without adding information.
+const PATCH_PREVIEW_DIFF_MAX_LINES = 400;
+const PATCH_PREVIEW_DIFF_MAX_CHARS = 50_000;
+const PATCH_PREVIEW_MAX_LINE_CHARS = 500;
+
+type PatchDiffRecord = {
+	kind: "added" | "context" | "removed";
+	line: string;
+	lineNumber: number;
+};
+
 function createPatchDiff(oldContent: string, newContent: string): { diff: string; added: number; removed: number } {
 	const parts = Diff.diffLines(oldContent, newContent);
 	const oldLines = oldContent.split("\n");
 	const newLines = newContent.split("\n");
 	const lineNumWidth = String(Math.max(oldLines.length, newLines.length)).length;
-	const output: string[] = [];
+	const records: PatchDiffRecord[] = [];
 	let oldLineNum = 1;
 	let newLineNum = 1;
 	let added = 0;
@@ -644,23 +657,86 @@ function createPatchDiff(oldContent: string, newContent: string): { diff: string
 
 		for (const line of rawLines) {
 			if (part.added) {
-				output.push(`+${String(newLineNum).padStart(lineNumWidth, " ")} ${line}`);
+				records.push({ kind: "added", line, lineNumber: newLineNum });
 				newLineNum++;
 				added++;
 				continue;
 			}
 
 			if (part.removed) {
-				output.push(`-${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`);
+				records.push({ kind: "removed", line, lineNumber: oldLineNum });
 				oldLineNum++;
 				removed++;
 				continue;
 			}
 
-			output.push(` ${String(oldLineNum).padStart(lineNumWidth, " ")} ${line}`);
+			records.push({ kind: "context", line, lineNumber: oldLineNum });
 			oldLineNum++;
 			newLineNum++;
 		}
+	}
+
+	// Keep only the changed lines plus a few lines of context. Without this, editing line 4000 of a
+	// 5000-line file stores and renders the whole file as context; the expanded TUI view then fills
+	// its budget with unchanged lines and can hide the edit entirely.
+	const included = new Uint8Array(records.length);
+	let hasChanges = false;
+	for (let index = 0; index < records.length; index++) {
+		if (records[index]?.kind === "context") {
+			continue;
+		}
+		hasChanges = true;
+		const start = Math.max(0, index - PATCH_PREVIEW_CONTEXT_LINES);
+		const end = Math.min(records.length - 1, index + PATCH_PREVIEW_CONTEXT_LINES);
+		for (let contextIndex = start; contextIndex <= end; contextIndex++) {
+			included[contextIndex] = 1;
+		}
+	}
+	if (!hasChanges) {
+		return { diff: "", added, removed };
+	}
+
+	const output: string[] = [];
+	let usedChars = 0;
+	let omitted = 0;
+	let skipping = false;
+	let truncated = false;
+	for (let index = 0; index < records.length; index++) {
+		if (included[index] !== 1) {
+			skipping = true;
+			continue;
+		}
+
+		const record = records[index];
+		if (!record) {
+			continue;
+		}
+		if (truncated) {
+			omitted++;
+			continue;
+		}
+		const sign = record.kind === "added" ? "+" : record.kind === "removed" ? "-" : " ";
+		const line =
+			record.line.length > PATCH_PREVIEW_MAX_LINE_CHARS
+				? `${record.line.slice(0, PATCH_PREVIEW_MAX_LINE_CHARS - 1)}…`
+				: record.line;
+		const rendered = `${sign}${String(record.lineNumber).padStart(lineNumWidth, " ")} ${line}`;
+		if (output.length >= PATCH_PREVIEW_DIFF_MAX_LINES - 1 || usedChars + rendered.length > PATCH_PREVIEW_DIFF_MAX_CHARS) {
+			truncated = true;
+			omitted++;
+			continue;
+		}
+		if (skipping) {
+			output.push(PATCH_PREVIEW_TRUNCATION_MARKER);
+			usedChars += PATCH_PREVIEW_TRUNCATION_MARKER.length;
+			skipping = false;
+		}
+		output.push(rendered);
+		usedChars += rendered.length;
+	}
+
+	if (omitted > 0) {
+		output.push(`${PATCH_PREVIEW_TRUNCATION_MARKER} ${omitted} more diff line(s)`);
 	}
 
 	return { diff: output.join("\n"), added, removed };
@@ -1011,6 +1087,15 @@ function countWindowMarkers(lines: string[]): number {
 	return markers;
 }
 
+const STORED_DIFF_OMISSION = /^… \d+ more diff line\(s\)$/;
+
+/** Lines of the stored diff that represent real source lines, excluding our own markers. */
+function countDiffSourceLines(diffText: string): number {
+	const lines = diffText.split("\n");
+	const omissionLines = lines[lines.length - 1] !== undefined && STORED_DIFF_OMISSION.test(lines[lines.length - 1] as string) ? 1 : 0;
+	return lines.length - countWindowMarkers(lines) - omissionLines;
+}
+
 /**
  * The TUI diff view. Collapsed rows get a smart window of the first changed hunk per file (enough to
  * recognize the edit without flooding the transcript); expanded rows get the whole diff, capped so a
@@ -1040,7 +1125,7 @@ function renderPatchPreview(
 			continue;
 		}
 
-		const totalLines = countLines(diffText);
+		const totalLines = countDiffSourceLines(diffText);
 		const windowText = expanded ? diffText : truncatePreview(diffText);
 		const windowLines = windowText.split("\n");
 		const limit = expanded ? expandedBudget : collapsedBudget;
@@ -1055,7 +1140,9 @@ function renderPatchPreview(
 		}
 
 		const renderedDiff = renderDiff(keptLines.join("\n"), file.movePath ?? file.filePath, theme);
-		const shownSourceLines = keptLines.length - countWindowMarkers(keptLines);
+		const keptOmission =
+			keptLines.length > 0 && STORED_DIFF_OMISSION.test(keptLines[keptLines.length - 1] as string) ? 1 : 0;
+		const shownSourceLines = keptLines.length - countWindowMarkers(keptLines) - keptOmission;
 		const hidden = Math.max(0, totalLines - shownSourceLines);
 		const block = [`${header}\n${indentBlock(renderedDiff, PATCH_RENDER_INDENT)}`];
 		if (hidden > 0) {
