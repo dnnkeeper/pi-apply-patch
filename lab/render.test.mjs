@@ -2,6 +2,7 @@
 // failures are visible instead of being swallowed by the diff preview.
 // Run: node lab/render.test.mjs
 import assert from "node:assert/strict";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createJiti } from "jiti";
 
@@ -248,6 +249,33 @@ const smallPreview = {
 	check("ambiguous rejection title", out.includes("Patch rejected · ambiguous anchor"), out);
 	check("ambiguous rejection hides the diff", !out.includes("newName"), out);
 	check("ambiguous rejection shows why", out.includes("matches 2 places"), out);
+}
+
+// 10. A CRLF file must not leave carriage returns in the preview: the TUI treats \r as a line
+// break, which used to add a blank row after every diff line and turn every line into muted meta.
+{
+	const root = path.resolve(import.meta.dirname, ".labr");
+	await rm(root, { recursive: true, force: true });
+	await mkdir(root, { recursive: true });
+	await writeFile(path.join(root, "crlf.md"), "line one\r\nline two\r\n");
+	const tool = createApplyPatchTool();
+	const execResult = await tool.execute(
+		"crlf",
+		{ input: "*** Begin Patch\n*** Update File: crlf.md\n@@\n line one\n+line three\n*** End Patch" },
+		undefined,
+		undefined,
+		{ cwd: root },
+	);
+	check("crlf patch applied", execResult.isError !== true, JSON.stringify(execResult.content));
+	const previewDiff = execResult.details?.preview?.files?.[0]?.diff ?? "";
+	check("preview diff has no carriage returns", previewDiff.length > 0 && !previewDiff.includes("\r"), JSON.stringify(previewDiff));
+	const out = tool
+		.renderResult(execResult, { expanded: true, isPartial: false }, theme, { cwd: root })
+		.render(200)
+		.join("\n");
+	check("rendered output has no carriage returns", !out.includes("\r"), JSON.stringify(out));
+	check("crlf added line is green", new RegExp(`${escapeRe(GREEN)}line three`).test(out), out);
+	await rm(root, { recursive: true, force: true });
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

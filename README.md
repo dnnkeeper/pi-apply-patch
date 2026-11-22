@@ -140,7 +140,7 @@ node lab/verify.test.mjs        # verify.ts: scopes, globs, needles, verdict for
 node lab/description.test.mjs   # the description's worked example must apply; every rule it states must hold — 23 checks
 node lab/claims.test.mjs        # behavioural claims in the docs: rewrite routes, @@ anchors, verify gating — 11 checks
 node lab/ambiguity.test.mjs     # ambiguous-anchor policy, execute wiring and config-file merging — 26 checks
-node lab/render.test.mjs        # TUI renderer: diff colours, collapse/expand, visible failures — 31 checks
+node lab/render.test.mjs        # TUI renderer: diff colours, collapse/expand, failures, CRLF — 35 checks
 node lab/e2e-jiti.test.mjs      # index.ts through jiti: real patch + verify round-trip — 14 checks
 ```
 

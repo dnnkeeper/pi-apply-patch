@@ -635,7 +635,9 @@ function createPatchDiff(oldContent: string, newContent: string): { diff: string
 	let removed = 0;
 
 	for (const part of parts) {
-		const rawLines = part.value.split("\n");
+		// CRLF files leave a trailing \r on every line. The TUI treats \r as a line break, which
+		// renders an empty row after each diff line; normalize before building the display text.
+		const rawLines = normalizePatchText(part.value).split("\n");
 		if (rawLines[rawLines.length - 1] === "") {
 			rawLines.pop();
 		}
@@ -903,7 +905,8 @@ function renderDiffLine(
 }
 
 function renderDiff(diffText: string, filePath: string, theme: ApplyPatchTheme): string {
-	const parsedLines = diffText.split("\n").map(parseRenderableDiffLine);
+	// Defensive: previews stored by older versions may still carry CRLF endings.
+	const parsedLines = normalizePatchText(diffText).split("\n").map(parseRenderableDiffLine);
 	const rendered: string[] = [];
 	let index = 0;
 
@@ -1030,14 +1033,15 @@ function renderPatchPreview(
 
 	for (const file of preview.files) {
 		const header = renderPatchFileHeader(file, cwd, theme);
+		const diffText = normalizePatchText(file.diff);
 		const noLineChanges = file.added === 0 && file.removed === 0;
-		if (!file.diff || noLineChanges || (!expanded && file.operation === "delete")) {
+		if (!diffText || noLineChanges || (!expanded && file.operation === "delete")) {
 			blocks.push(header);
 			continue;
 		}
 
-		const totalLines = countLines(file.diff);
-		const windowText = expanded ? file.diff : truncatePreview(file.diff);
+		const totalLines = countLines(diffText);
+		const windowText = expanded ? diffText : truncatePreview(diffText);
 		const windowLines = windowText.split("\n");
 		const limit = expanded ? expandedBudget : collapsedBudget;
 		const keptLines = windowLines.slice(0, Math.max(0, limit));
